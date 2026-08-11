@@ -1,0 +1,21 @@
+node_modules/
+build/
+dist/
+coverage/
+logs/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# The SQLite database is a build artifact, not source. It was previously
+# committed, which is how a truncated, unreadable database.sqlite shipped with
+# the project and made the app fail to start. Rebuild it with `npm run db:reset`.
+database.sqlite
+database.sqlite-wal
+database.sqlite-shm
+database.sqlite.building-*
+database.sqlite.backup-*
+*.runtime-lock
+*.runtime-lock.candidate-*
+*.runtime-lock.stale-*

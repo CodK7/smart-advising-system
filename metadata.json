@@ -1,0 +1,6 @@
+{
+  "name": "Smart Academic Advising System",
+  "description": "A smart academic advising portal for the University of Technology and Applied Sciences, Nizwa, with server-enforced role-based access for students, advisors, and administrators.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

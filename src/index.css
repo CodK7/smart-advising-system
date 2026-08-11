@@ -1,0 +1,69 @@
+/*
+ * Typography
+ *
+ * The project previously loaded no webfonts at all, so Arabic fell back to
+ * whatever the OS provided — usually a face with no proper Arabic hinting and
+ * a line height tuned for Latin text.
+ *
+ * IBM Plex Sans Arabic and Inter are paired deliberately: both are humanist
+ * sans faces on a similar vertical rhythm, so mixed Arabic/Latin lines sit on
+ * a consistent baseline instead of one script visually dominating.
+ *
+ * The font stylesheet is linked directly from index.html so it can load in
+ * parallel with this bundle instead of being discovered through a nested CSS
+ * import. Keep Tailwind as the only CSS import here.
+ */
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Inter', 'IBM Plex Sans Arabic', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+:root {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/*
+ * Arabic needs more leading than Latin at the same size: ascenders and
+ * descenders are taller and diacritics sit above the cap height. Latin
+ * tracking is tightened slightly; Arabic must never be tracked, because
+ * positive letter-spacing breaks the cursive joins between letters.
+ */
+[dir='rtl'],
+[lang='ar'] {
+  line-height: 1.85;
+  letter-spacing: 0;
+}
+
+[dir='ltr'] {
+  line-height: 1.6;
+  letter-spacing: -0.011em;
+}
+
+/* Course codes, IDs and grades align better on a fixed numeral width. */
+.font-mono {
+  font-variant-numeric: tabular-nums;
+}
+
+@layer components {
+  /* Shared form control, used by the admin edit dialogs. */
+  .input {
+    @apply w-full px-3 py-2 border border-slate-300 rounded-lg text-sm transition
+           focus:outline-none focus:border-[#1A365D] focus:ring-2 focus:ring-[#1A365D]/15;
+  }
+}
+
+/* Respect users who have asked their OS to reduce motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

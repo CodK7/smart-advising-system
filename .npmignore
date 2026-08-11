@@ -1,0 +1,37 @@
+# Dependencies and generated output
+node_modules/
+dist/
+build/
+coverage/
+
+# Databases and SQLite runtime artifacts
+database.sqlite
+database.sqlite-*
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.runtime-lock
+*.runtime-lock.*
+
+# Source-control, diagnostics, and local configuration
+.git/
+logs/
+*.log
+.env
+.env.*
+!.env.example
+
+# Credentials and other sensitive material
+secrets/
+secret/
+*.pem
+*.key
+*.pfx
+*.crt
+
+# Temporary files and old release archives
+tmp/
+temp/
+*.tmp
+*.temp
+*.zip
