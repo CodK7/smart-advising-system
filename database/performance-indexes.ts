@@ -17,5 +17,6 @@ const PERFORMANCE_INDEXES = [
 
 /** Adds only missing indexes; it never changes user, academic, or session data. */
 export async function ensurePerformanceIndexes(db: Client): Promise<void> {
+  if (db.dialect === 'postgres') return;
   for (const sql of PERFORMANCE_INDEXES) await db.execute(sql);
 }

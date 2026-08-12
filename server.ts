@@ -7,6 +7,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import type { Server } from 'node:http';
 import { createClient, type InStatement, type Transaction } from './database/sqlite.js';
+import { createPostgresClient } from './database/postgres.js';
 import { GoogleGenAI } from '@google/genai';
 import { BOOKS } from './src/books.js';
 import { LEVEL_ORDER, studyPlanSourceFor } from './database/dataset.js';
@@ -55,7 +56,8 @@ if (!Number.isSafeInteger(configuredPort) || configuredPort < 1 || configuredPor
 }
 const PORT = configuredPort;
 const APP_HOST = process.env.APP_HOST?.trim() || '127.0.0.1';
-const DATABASE_PATH = resolveDatabasePath();
+const DATABASE_URL = process.env.DATABASE_URL?.trim() || '';
+const DATABASE_PATH = DATABASE_URL ? undefined : resolveDatabasePath();
 const API_ONLY_TEST = process.env.SAS_INTERNAL_API_ONLY === '1';
 if (API_ONLY_TEST && process.env.NODE_ENV !== 'test') {
   throw new Error('SAS_INTERNAL_API_ONLY is restricted to NODE_ENV=test.');
@@ -180,7 +182,9 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-const client = createClient({ url: localDatabaseUrl(DATABASE_PATH) });
+const client = DATABASE_URL
+  ? createPostgresClient(DATABASE_URL)
+  : createClient({ url: localDatabaseUrl(DATABASE_PATH!) });
 
 // ---------------------------------------------------------------------------
 // Startup
@@ -190,8 +194,8 @@ async function initDb() {
   const recoveryGuidance =
     process.env.NODE_ENV === 'production'
       ? 'Restore a verified backup or run an explicit, reviewed schema migration before restarting the service.'
-      : 'Run `npm run db:reset` to rebuild the local development database.';
-  if (!fs.existsSync(DATABASE_PATH)) {
+      : 'Run `npm run db:reset` to rebuild the local development database, or set DATABASE_URL for PostgreSQL.';
+  if (!DATABASE_URL && !fs.existsSync(DATABASE_PATH!)) {
     throw new Error(`The configured SQLite database is missing. ${recoveryGuidance}`);
   }
   // Fail fast and clearly rather than surfacing as a 500 on every route, which
@@ -201,7 +205,8 @@ async function initDb() {
     const version = await client.execute(
       "SELECT value FROM app_metadata WHERE key = 'schema_version'",
     );
-    if (String(version.rows[0]?.value ?? '') !== '6') {
+    const expectedSchemaVersion = DATABASE_URL ? '7' : '6';
+    if (String(version.rows[0]?.value ?? '') !== expectedSchemaVersion) {
       throw new Error('database schema is out of date');
     }
     await ensurePerformanceIndexes(client);
@@ -216,7 +221,7 @@ async function initDb() {
     await assertOfficialAccountState(client, { checkCredentialHashes: process.env.NODE_ENV === 'production' });
   } catch (err) {
     throw new Error(
-      `The configured SQLite database could not be read (${(err as Error).message}). ` +
+      `The configured ${DATABASE_URL ? 'PostgreSQL' : 'SQLite'} database could not be read (${(err as Error).message}). ` +
         recoveryGuidance,
     );
   }
@@ -832,8 +837,8 @@ app.get(
     const stats = await client.execute({
       sql: `WITH student_stats AS (
               SELECT COUNT(*) AS total_students,
-                     COALESCE(SUM(gpa < ?), 0) AS at_risk_students,
-                     COALESCE(SUM(gpa >= ?), 0) AS good_standing_students,
+                     COALESCE(SUM(CASE WHEN gpa < ? THEN 1 ELSE 0 END), 0) AS at_risk_students,
+                     COALESCE(SUM(CASE WHEN gpa >= ? THEN 1 ELSE 0 END), 0) AS good_standing_students,
                      ROUND(AVG(gpa), 2) AS average_gpa
               FROM students
             )
@@ -1102,7 +1107,7 @@ app.post(
         return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
       }
       const inserted = await transaction.execute({
-        sql: 'INSERT INTO advisor_notes (student_id, advisor_id, content) VALUES (?, ?, ?)',
+        sql: 'INSERT INTO advisor_notes (student_id, advisor_id, content) VALUES (?, ?, ?) RETURNING id',
         args: [studentId, req.user!.id, content],
       });
       await transaction.commit();
@@ -1463,7 +1468,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
 async function startServer() {
   validateProductionOrigin();
-  databaseRuntimeLock = await acquireDatabaseRuntimeLock(DATABASE_PATH, 'server');
+  if (!DATABASE_URL) databaseRuntimeLock = await acquireDatabaseRuntimeLock(DATABASE_PATH!, 'server');
   await initDb();
 
   if (API_ONLY_TEST) {

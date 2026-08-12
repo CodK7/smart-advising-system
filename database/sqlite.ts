@@ -29,6 +29,7 @@ export interface Transaction {
 }
 
 export interface Client {
+  readonly dialect?: 'sqlite' | 'postgres';
   execute(statement: InStatement): Promise<ResultSet>;
   executeMultiple(sql: string): Promise<void>;
   batch(statements: readonly InStatement[], mode?: 'read' | 'write'): Promise<ResultSet[]>;
@@ -52,7 +53,13 @@ function executeSync(database: DatabaseSync, statement: InStatement): ResultSet 
   const { sql, args } = normalize(statement);
   const prepared = database.prepare(sql);
   if (prepared.columns().length > 0) {
-    return { rows: prepared.all(...args) as Row[], rowsAffected: 0, lastInsertRowid: 0n };
+    const rows = prepared.all(...args) as Row[];
+    const returnedId = rows[0]?.id;
+    return {
+      rows,
+      rowsAffected: 0,
+      lastInsertRowid: typeof returnedId === 'number' || typeof returnedId === 'bigint' ? returnedId : 0n,
+    };
   }
   const result = prepared.run(...args);
   return {
@@ -113,6 +120,7 @@ class LocalTransaction implements Transaction {
 }
 
 class LocalClient implements Client {
+  readonly dialect = 'sqlite' as const;
   private readonly database: DatabaseSync;
   private gate: Promise<void> = Promise.resolve();
   private closed = false;

@@ -42,6 +42,6 @@ Browser testing requires Chrome or Chromium. Set `CHROME_PATH` when the executab
 
 Copy `.env.example` to `.env.local` only for local development. Shell variables have highest precedence. Tests and production intentionally ignore `.env.local`. Never commit `.env`, `.env.local`, generated databases, logs, or build artifacts.
 
-`DATABASE_PATH` accepts only a local file ending in `.db`, `.sqlite`, or `.sqlite3`. Remote database URLs and network shares are rejected.
+`DATABASE_PATH` accepts only a local file ending in `.db`, `.sqlite`, or `.sqlite3`. For durable deployment, set `DATABASE_URL` to a PostgreSQL connection URL (for example, from Neon); it takes precedence over `DATABASE_PATH`.
 
 Production requires `APP_ORIGIN` to be a public HTTPS origin. Configure `TRUST_PROXY` only when a trusted reverse proxy is actually in front of the application.

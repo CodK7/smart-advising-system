@@ -112,7 +112,7 @@ function plannedSemester(planCodes: string[], code: string): 1 | 2 {
   return idx < Math.ceil(electives.length / 2) ? 1 : 2;
 }
 
-interface Gap {
+export interface Gap {
   kind: string;
   detail: string;
 }
@@ -184,9 +184,12 @@ async function publishDatabase(stagingPath: string, targetPath: string): Promise
   await Promise.all(suffixes.map((suffix) => removeDatabaseArtifact(backupPath + suffix)));
 }
 
-async function populateDatabase(db: Client, gaps: Gap[]): Promise<void> {
-  await db.executeMultiple(fs.readFileSync(path.resolve('database/schema.sql'), 'utf-8'));
-  await db.execute("INSERT INTO app_metadata (key, value) VALUES ('schema_version', '6')");
+export async function populateDatabase(
+  db: Pick<Client, 'execute' | 'batch'>,
+  gaps: Gap[],
+  schemaVersion = '6',
+): Promise<void> {
+  await db.execute({ sql: "INSERT INTO app_metadata (key, value) VALUES ('schema_version', ?)", args: [schemaVersion] });
   await db.execute({
     sql: "INSERT INTO app_metadata (key, value) VALUES ('credential_mode', ?)",
     args: [credentialMode],
@@ -411,6 +414,7 @@ async function build(): Promise<Gap[]> {
   let databaseClosed = false;
   let completed = false;
   try {
+    await db.executeMultiple(fs.readFileSync(path.resolve('database/schema.sql'), 'utf-8'));
     await populateDatabase(db, gaps);
     db.close();
     databaseClosed = true;
@@ -510,15 +514,19 @@ async function orchestrateSeed(): Promise<void> {
   }
 }
 
-const operation = DIRECT_BUILD
-  ? build().then(reportBuild)
-  : orchestrateSeed();
+const isDirectExecution = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
-operation
-  .then(() => {
-    process.exitCode = 0;
-  })
-  .catch((err) => {
-    console.error('Seeding failed:', err);
-    process.exitCode = 1;
-  });
+if (isDirectExecution) {
+  const operation = DIRECT_BUILD
+    ? build().then(reportBuild)
+    : orchestrateSeed();
+
+  operation
+    .then(() => {
+      process.exitCode = 0;
+    })
+    .catch((err) => {
+      console.error('Seeding failed:', err);
+      process.exitCode = 1;
+    });
+}

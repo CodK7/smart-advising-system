@@ -6,7 +6,7 @@ A bilingual React, TypeScript, Express, and SQLite academic-advising application
 
 - Node.js 22.13 or newer
 - npm
-- A local writable path for SQLite
+- A local writable path for SQLite during development, or a PostgreSQL URL for persistent deployment
 
 ## Install and run
 
@@ -53,6 +53,7 @@ Copy `.env.example` to `.env.local` for development overrides. Production intent
 PORT=5173
 APP_HOST=127.0.0.1
 DATABASE_PATH=database.sqlite
+DATABASE_URL=
 TRUST_PROXY=false
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.6-flash
@@ -89,10 +90,16 @@ Test databases are created in temporary directories and do not replace the works
 ## Production deployment
 
 1. Run `npm ci` and `npm test` on the target platform.
-2. Set `NODE_ENV=production`, `APP_ORIGIN`, `DATABASE_PATH`, and any optional Gemini configuration.
+2. Create a free Neon PostgreSQL database and set its connection string as the secret `DATABASE_URL`. Set `NODE_ENV=production`, `APP_ORIGIN`, and any optional Gemini configuration. `DATABASE_URL` takes precedence over `DATABASE_PATH`.
 3. Run `npm run db:ensure`, `npm run db:verify`, and `npm run build`.
 4. Start with `npm start` or PM2 using `ecosystem.config.cjs`.
-5. Put the app behind HTTPS and persist/back up the SQLite database.
+5. Put the app behind HTTPS. The PostgreSQL database retains runtime data across Render restarts and deploys.
+
+### Free persistent deployment
+
+For the public demo, deploy the Node web service to Render and create the database in Neon. Add the Neon connection string only to Render as `DATABASE_URL`—never commit it to GitHub. On an empty PostgreSQL database, `npm start` creates the schema and imports the deterministic demo data once. Later starts verify the schema and never reset existing user data.
+
+Local development remains SQLite-based when `DATABASE_URL` is blank. Use `npm run db:reset:postgres` only for a new, empty PostgreSQL database; it intentionally refuses to overwrite an initialized database.
 
 Production startup refuses to rebuild an existing incompatible database automatically. A schema or credential-source mismatch fails closed so an operator can back up and perform an explicit migration.
 
