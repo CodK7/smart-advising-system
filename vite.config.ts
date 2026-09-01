@@ -17,8 +17,18 @@ export default defineConfig(() => {
       host: 'localhost',
       port: 5173,
       strictPort: true,
-      hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // For Workers dev (wrangler dev), proxy /api requests to the Worker.
+      // Run `wrangler dev` (default port 8787) in one terminal and `vite` in another.
+      proxy: {
+        '/api': {
+          target: 'http://127.0.0.1:8787',
+          changeOrigin: true,
+        },
+      },
+    },
+    build: {
+      outDir: 'dist',
+      emptyOutDir: true,
     },
   };
 });

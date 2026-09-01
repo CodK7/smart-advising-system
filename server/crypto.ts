@@ -1,18 +1,50 @@
 /**
  * Password and credential hashing.
  *
- * Uses Node's built-in scrypt, so there is no native dependency to compile and
- * nothing extra to install. Each hash carries its own random salt and the
- * parameters used to produce it, so the cost can be raised later without
- * invalidating existing hashes.
+ * Uses scrypt, so there is no native dependency to compile and nothing extra
+ * to install. Each hash carries its own random salt and the parameters used
+ * to produce it, so the cost can be raised later without invalidating
+ * existing hashes.
+ *
+ * Compatible with both Node.js and Cloudflare Workers (via the
+ * `nodejs_compat_v2` compatibility flag which polyfills `node:crypto` and
+ * `node:buffer`).
  */
 
-import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { createHash, scrypt as scryptCb, webcrypto } from 'node:crypto';
 import { promisify } from 'node:util';
 
-const scrypt = promisify(scryptCb) as (
-  password: string | Buffer,
-  salt: string | Buffer,
+// `timingSafeEqual` is also provided by node:crypto in both runtimes.
+import { timingSafeEqual } from 'node:crypto';
+
+// Cloudflare Workers' node:crypto polyfill types `randomBytes` with no
+// arguments, but at runtime it accepts a length parameter. Use the Web Crypto
+// API for random bytes — it works in both Node.js and Workers without casts.
+function randomBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  webcrypto.getRandomValues(bytes);
+  return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  let hex = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i += 1) {
+    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+const scrypt = promisify(scryptCb) as unknown as (
+  password: string | Uint8Array,
+  salt: string | Uint8Array,
   keylen: number,
 ) => Promise<Buffer>;
 
@@ -25,7 +57,9 @@ const PASSWORD_CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/;
 export async function hashSecret(secret: string): Promise<string> {
   const salt = randomBytes(SALT_LENGTH);
   const derived = await scrypt(secret.normalize('NFKC'), salt, KEY_LENGTH);
-  return `scrypt$${salt.toString('hex')}$${derived.toString('hex')}`;
+  // `derived` is a Buffer (which is a Uint8Array). Convert to hex directly.
+  const keyBytes = derived instanceof Uint8Array ? derived : new Uint8Array(derived);
+  return `scrypt$${bytesToHex(salt)}$${bytesToHex(keyBytes)}`;
 }
 
 /**
@@ -45,15 +79,19 @@ export async function verifySecret(secret: string, stored: string | null | undef
   const saltHex = valid ? parts[1] : '00'.repeat(SALT_LENGTH);
   const keyHex = valid ? parts[2] : '00'.repeat(KEY_LENGTH);
 
-  const expected = Buffer.from(keyHex, 'hex');
+  const expected = hexToBytes(keyHex);
+  const salt = hexToBytes(saltHex);
 
-  const derived = await scrypt(secret.normalize('NFKC'), Buffer.from(saltHex, 'hex'), KEY_LENGTH);
-  return valid && timingSafeEqual(derived, expected);
+  const derivedBuffer = await scrypt(secret.normalize('NFKC'), salt, KEY_LENGTH);
+  const derived = derivedBuffer instanceof Uint8Array ? derivedBuffer : new Uint8Array(derivedBuffer);
+
+  if (!valid) return false;
+  return timingSafeEqual(derived, expected);
 }
 
 /** A cryptographically random session token. */
 export function newSessionToken(): string {
-  return randomBytes(32).toString('hex');
+  return bytesToHex(randomBytes(32));
 }
 
 /** Store only a one-way digest of bearer session tokens. */

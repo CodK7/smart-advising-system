@@ -1,6 +1,13 @@
 /**
  * Promise-based PostgreSQL adapter.  It intentionally has the same small
  * surface as the SQLite adapter, so application code remains database-agnostic.
+ *
+ * Compatible with both Node.js and Cloudflare Workers:
+ * - In Node.js, pass a standard postgres:// connection string.
+ * - In Cloudflare Workers, pass env.HYPERDRIVE.connectionString from a
+ *   Hyperdrive binding. The `pg` library uses `net.Socket` which Cloudflare's
+ *   Workers runtime polyfills via `nodejs_compat_v2`; Hyperdrive intercepts
+ *   those connections and provides a managed pool against the origin database.
  */
 import { Pool, type PoolClient } from 'pg';
 import type { Client, InArgs, InStatement, ResultSet, Row, Transaction } from './sqlite.js';
@@ -153,8 +160,10 @@ class PostgresClient implements Client {
 
 export function createPostgresClient(connectionString: string): Client {
   if (!/^postgres(?:ql)?:\/\//i.test(connectionString)) {
-    throw new Error('DATABASE_URL must be a PostgreSQL connection URL.');
+    throw new Error('Connection string must be a PostgreSQL URL.');
   }
+  // Hyperdrive (in Workers) already pools connections, so we keep a small
+  // per-isolate pool. In Node.js (dev) this is the only pool.
   return new PostgresClient(new Pool({
     connectionString,
     max: 5,

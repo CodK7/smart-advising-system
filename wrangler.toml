@@ -1,0 +1,24 @@
+name = "utas-smart-academic-advising"
+main = "src/worker.ts"
+compatibility_date = "2025-10-01"
+compatibility_flags = ["nodejs_compat_v2"]
+
+[assets]
+directory = "dist/"
+not_found_handling = "single-page-application"
+
+# Scheduled handler: purge expired sessions hourly. Replaces the setInterval
+# used in the previous Express server (Workers have no persistent timers).
+[triggers]
+crons = ["0 * * * *"]
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "REPLACE_WITH_YOUR_HYPERDRIVE_ID"
+
+# Secrets (set with `wrangler secret put <NAME>`):
+#   GEMINI_API_KEY     - Google Gemini API key (server-only). Optional.
+#
+# Variables (set in the Cloudflare dashboard or via wrangler):
+#   APP_ORIGIN         - Required in production. HTTPS origin URL.
+#   GEMINI_MODEL       - Gemini model name. Default: "gemini-3.6-flash"

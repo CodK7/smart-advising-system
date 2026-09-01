@@ -1,21 +1,27 @@
 # Codk7 — UTAS Smart Academic Advising System
 
-A bilingual React, TypeScript, Express, and SQLite academic-advising application for UTAS Nizwa. Authentication, authorization, sessions, academic records, messaging, advisor notes, settings, and AI context are enforced on the backend.
+A bilingual React, TypeScript, Hono, and PostgreSQL academic-advising application for UTAS Nizwa. Authentication, authorization, sessions, academic records, messaging, advisor notes, settings, and AI context are enforced on the backend. Deployed to **Cloudflare Workers** with the existing PostgreSQL database (Neon or any hosted provider) accessed via **Cloudflare Hyperdrive**.
 
 ## Requirements
 
 - Node.js 22.13 or newer
 - npm
-- A local writable path for SQLite during development, or a PostgreSQL URL for persistent deployment
+- A Cloudflare account (for deployment)
+- A PostgreSQL database (Neon, Supabase, RDS, or self-hosted) — the existing Neon database continues to work without changes
 
 ## Install and run
 
 ```bash
 npm ci
-npm run dev
+npm run build
+npm run cf:dev      # Cloudflare Workers local dev (recommended)
+# or
+npm run dev:node    # Node.js local dev (Hono + @hono/node-server)
+# or
+npm run dev:frontend # Vite dev server with HMR (proxies /api to wrangler dev)
 ```
 
-Open `http://localhost:5173`. Do not open `index.html` directly; the application requires its backend API.
+Open `http://localhost:5173` (Vite) or `http://localhost:8787` (Wrangler). Do not open `index.html` directly; the application requires its backend API.
 
 The official login PDF is the only source of truth for accounts and credentials. The database seed contains exactly:
 
@@ -47,24 +53,25 @@ There is no automatic Mock Mode. When the backend cannot be reached, the fronten
 
 ## Environment
 
-Copy `.env.example` to `.env.local` for development overrides. Production intentionally ignores `.env.local`; provide production values through the hosting platform or process environment.
+### Local development (`.env.local`)
+
+Copy `.env.example` to `.env.local` for development overrides. Production intentionally ignores `.env.local`; provide production values through Cloudflare's bindings and secrets.
 
 ```env
-PORT=5173
-APP_HOST=127.0.0.1
-DATABASE_PATH=database.sqlite
+# Empty for local Node.js dev (uses SQLite). For Cloudflare dev, wrangler.toml
+# controls bindings directly; DATABASE_URL is used by the Node.js entry point.
 DATABASE_URL=
-TRUST_PROXY=false
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.6-flash
+APP_ORIGIN=http://127.0.0.1:5173
 ```
 
-Production additionally requires an HTTPS origin:
+### Cloudflare Workers (production)
 
-```env
-NODE_ENV=production
-APP_ORIGIN=https://your-domain.example
-```
+- `HYPERDRIVE` binding → PostgreSQL connection string (configured in `wrangler.toml`)
+- `GEMINI_API_KEY` → `wrangler secret put GEMINI_API_KEY`
+- `GEMINI_MODEL` → `wrangler secret put GEMINI_MODEL` or set in the dashboard
+- `APP_ORIGIN` → required, set in the Cloudflare dashboard (HTTPS origin URL)
 
 Never place secrets in variables prefixed with `VITE_`, because Vite exposes those values to browser code.
 
@@ -72,36 +79,57 @@ Never place secrets in variables prefixed with `VITE_`, because Vite exposes tho
 
 | Command | Purpose |
 |---|---|
-| `npm run dev` | Ensure the development database and start the unified Express/Vite server |
-| `npm run db:reset` | Rebuild the local database from the checked official-roster transcription and academic reference data |
+| `npm run cf:dev` | Run the Worker locally with Wrangler (recommended) |
+| `npm run dev:node` | Run the Hono app directly in Node.js |
+| `npm run dev:frontend` | Run the Vite dev server with HMR (proxy `/api` to Wrangler) |
+| `npm run build` | Create the production frontend bundle in `dist/` |
+| `npm run cf:deploy` | Deploy to Cloudflare Workers |
+| `npm run db:reset` | Rebuild the local SQLite database from the checked official-roster transcription |
+| `npm run db:reset:postgres` | Seed an empty PostgreSQL database (refuses to overwrite existing data) |
 | `npm run db:verify` | Verify schema, official users, password hashes, roles, and relationships |
 | `npm run typecheck` | Run strict TypeScript checks |
 | `npm run lint` | Run ESLint, React Hooks, and JSX accessibility rules |
 | `npm run test:unit` | Run unit and component tests |
 | `npm run test:db` | Seed and verify an isolated database |
 | `npm run test:api` | Run isolated authentication and authorization integration tests |
-| `npm run test:browser` | Run Chrome/Chromium smoke tests |
 | `npm test` | Run the main automated quality gate |
-| `npm run build` | Create the production frontend bundle in `dist/` |
-| `npm start` | Validate the production database, build, and start the production server |
 
 Test databases are created in temporary directories and do not replace the workspace database.
 
-## Production deployment
+## Production deployment (Cloudflare Workers)
 
-1. Run `npm ci` and `npm test` on the target platform.
-2. Create a free Neon PostgreSQL database and set its connection string as the secret `DATABASE_URL`. Set `NODE_ENV=production`, `APP_ORIGIN`, and any optional Gemini configuration. `DATABASE_URL` takes precedence over `DATABASE_PATH`.
-3. Run `npm run db:ensure`, `npm run db:verify`, and `npm run build`.
-4. Start with `npm start` or PM2 using `ecosystem.config.cjs`.
-5. Put the app behind HTTPS. The PostgreSQL database retains runtime data across Render restarts and deploys.
+1. Run `npm ci` and `npm test` locally.
+2. Create a Cloudflare account and install Wrangler: `npm install -g wrangler` (or use `npx wrangler`).
+3. Authenticate: `npx wrangler login`.
+4. Create a Hyperdrive instance pointing to your PostgreSQL database:
+   ```bash
+   npx wrangler hyperdrive create utas-db --connection-string="postgres://user:pass@host:port/db"
+   ```
+   Note the returned Hyperdrive ID and paste it into `wrangler.toml` under `[[hyperdrive]] id`.
+5. Build the frontend: `npm run build`.
+6. Set secrets:
+   ```bash
+   npx wrangler secret put GEMINI_API_KEY
+   npx wrangler secret put APP_ORIGIN   # e.g. https://your-domain.example
+   ```
+7. Deploy: `npm run cf:deploy`.
 
-### Free persistent deployment
+The Worker serves the API at `/api/*` and the built frontend assets from `dist/` via Cloudflare's Assets binding. A Cloudflare Cron Trigger purges expired sessions every hour.
 
-For the public demo, deploy the Node web service to Render and create the database in Neon. Add the Neon connection string only to Render as `DATABASE_URL`—never commit it to GitHub. On an empty PostgreSQL database, `npm start` creates the schema and imports the deterministic demo data once. Later starts verify the schema and never reset existing user data.
+### Architecture
 
-Local development remains SQLite-based when `DATABASE_URL` is blank. Use `npm run db:reset:postgres` only for a new, empty PostgreSQL database; it intentionally refuses to overwrite an initialized database.
+- **Backend**: Hono on Cloudflare Workers (`src/worker.ts` → `server.ts`)
+- **Database**: PostgreSQL on Neon (or any provider) via Cloudflare Hyperdrive
+- **Frontend**: React 19 + Vite 6 + Tailwind CSS 4, built to `dist/` and served as static assets
+- **Sessions**: HTTP-only `Secure` cookies; session data stored in the `sessions` table
+- **AI**: Google Gemini with a local fallback engine
+- **Cron**: Hourly session purge via `[triggers] crons`
 
-Production startup refuses to rebuild an existing incompatible database automatically. A schema or credential-source mismatch fails closed so an operator can back up and perform an explicit migration.
+### Data safety
+
+- The existing PostgreSQL schema and data are **never modified or overwritten** by the Worker.
+- The database adapter is read/write; the application does not run any DDL on startup.
+- Production refuses to start if the schema version is out of date; explicit migrations are required.
 
 ## Source-data limitations
 

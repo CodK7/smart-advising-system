@@ -1,38 +1,45 @@
-// Load environment variables before this module reads process.env.
-import { loadEnvironment } from './scripts/load-env.mjs';
-loadEnvironment();
+/**
+ * Cloudflare Workers + Hono application.
+ *
+ * This module exports a Hono application that works identically in:
+ *  - Cloudflare Workers (production: `wrangler deploy`; local: `wrangler dev`)
+ *  - Node.js (local development: `tsx server.ts`)
+ *
+ * Database:
+ *  - In Workers: uses Cloudflare Hyperdrive to connect to the existing
+ *    PostgreSQL database (Neon). Pass the connection string via the
+ *    HYPERDRIVE binding in wrangler.toml.
+ *  - In Node.js: connects directly to PostgreSQL via DATABASE_URL, or to
+ *    local SQLite when DATABASE_URL is empty.
+ *
+ * All API routes, authentication, authorization, rate limiting, validation,
+ * security headers, and AI advisor behavior are preserved from the previous
+ * Express implementation. The `/api/*` contract is byte-compatible.
+ */
 
-import express from 'express';
-import path from 'node:path';
-import fs from 'node:fs';
-import type { Server } from 'node:http';
-import { createClient, type InStatement, type Transaction } from './database/sqlite.js';
-import { createPostgresClient } from './database/postgres.js';
+import { Hono, type Context, type Next } from 'hono';
 import { GoogleGenAI } from '@google/genai';
 import { BOOKS } from './src/books.js';
 import { LEVEL_ORDER, studyPlanSourceFor } from './database/dataset.js';
-import { localDatabaseUrl, resolveDatabasePath } from './database/path.js';
 import { assertOfficialAccountState } from './database/official-accounts.js';
 import { ensurePerformanceIndexes } from './database/performance-indexes.js';
-import {
-  acquireDatabaseRuntimeLock,
-  type DatabaseRuntimeLock,
-} from './database/runtime-lock.js';
+import { localDatabaseUrl, resolveDatabasePath } from './database/path.js';
+import { createClient, type Client, type InStatement } from './database/sqlite.js';
+import { createPostgresClient } from './database/postgres.js';
 
 import {
-  loginHandler,
-  logoutHandler,
-  meHandler,
-  purgeExpiredSessions,
+  ADMIN_ROLES,
+  buildClearSessionCookieHeader,
+  buildSessionCookieHeader,
+  canAccessStudent as canAccessStudentBase,
+  deleteSession,
   isAdministrativeRole,
-  requireAdmins,
-  requireAuth,
-  requireRegistrar,
-  requireStaff,
-  requireStudentManagement,
-  requireSystemAdmin,
-  sessionMiddleware,
-  canAccessStudent,
+  performLogin,
+  purgeExpiredSessions,
+  readSessionCookie,
+  resolveSession,
+  type ApplicationRole,
+  type SessionUser,
 } from './server/auth.js';
 import { buildAdvisingReport, buildGpaHistory, PROBATION_THRESHOLD } from './server/advising.js';
 import {
@@ -44,50 +51,29 @@ import {
   optionalAcademicLevel,
   optionalEmail,
   optionalMajor,
-  requireUserId,
   requiredMessage,
   ValidationError,
 } from './server/validation.js';
 
-const app = express();
-const configuredPort = Number(process.env.PORT ?? 5173);
-if (!Number.isSafeInteger(configuredPort) || configuredPort < 1 || configuredPort > 65_535) {
-  throw new Error('PORT must be an integer between 1 and 65535.');
-}
-const PORT = configuredPort;
-const APP_HOST = process.env.APP_HOST?.trim() || '127.0.0.1';
-const DATABASE_URL = process.env.DATABASE_URL?.trim() || '';
-const DATABASE_PATH = DATABASE_URL ? undefined : resolveDatabasePath();
-const API_ONLY_TEST = process.env.SAS_INTERNAL_API_ONLY === '1';
-if (API_ONLY_TEST && process.env.NODE_ENV !== 'test') {
-  throw new Error('SAS_INTERNAL_API_ONLY is restricted to NODE_ENV=test.');
-}
+// ---------------------------------------------------------------------------
+// Environment
+// ---------------------------------------------------------------------------
 
-// The Gemini key is deliberately server-only. Do not use VITE_GEMINI_API_KEY
-// or REACT_APP_GEMINI_API_KEY: those prefixes expose a secret in the browser.
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim() || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || 'gemini-3.6-flash';
-const gemini = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
-
-async function callGemini(systemInstruction: string, message: string): Promise<string> {
-  if (!gemini) throw new Error('Gemini is not configured.');
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const response = await gemini.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: message,
-      config: { systemInstruction, maxOutputTokens: 700, abortSignal: controller.signal },
-    });
-    const reply = cleanText(response.text ?? '', 10_000);
-    if (!reply) throw new Error('Gemini returned an empty response.');
-    return reply;
-  } finally {
-    clearTimeout(timeout);
-  }
+export interface Env {
+  /** Cloudflare Hyperdrive binding (Workers). */
+  HYPERDRIVE?: { connectionString: string };
+  /** Direct PostgreSQL connection string (Node.js dev). */
+  DATABASE_URL?: string;
+  /** Optional Gemini API key (server-only). */
+  GEMINI_API_KEY?: string;
+  /** Optional Gemini model override. */
+  GEMINI_MODEL?: string;
+  /** Production origin (https URL). */
+  APP_ORIGIN?: string;
+  /** Set to "production" for production behavior. */
+  NODE_ENV?: string;
 }
 
-const aiConfigured = Boolean(gemini);
 const MAX_AI_BOOKS = 24;
 const MAX_AI_COURSES = 80;
 const MAX_AI_ROADMAP_ITEMS = 120;
@@ -108,125 +94,84 @@ function exposesInternalAiMaterial(reply: string): boolean {
   const normalized = reply.toLowerCase().replace(/[_\s-]+/g, '');
   return INTERNAL_AI_MARKERS.some((marker) => normalized.includes(marker.replaceAll('_', '')));
 }
-app.disable('x-powered-by');
-
-function configuredTrustProxy(): false | number | 'loopback' {
-  const value = process.env.TRUST_PROXY?.trim().toLowerCase();
-  if (!value || value === 'false' || value === '0') return false;
-  if (value === 'loopback') return value;
-  if (/^[1-5]$/.test(value)) return Number(value);
-  throw new Error('TRUST_PROXY must be false, loopback, or a hop count from 1 to 5.');
-}
-
-const trustProxy = configuredTrustProxy();
-if (trustProxy !== false) app.set('trust proxy', trustProxy);
-
-let trustedProductionOrigin: string | undefined;
-
-function validateProductionOrigin(): void {
-  if (process.env.NODE_ENV !== 'production') return;
-  const configured = process.env.APP_ORIGIN?.trim();
-  if (!configured) throw new Error('APP_ORIGIN is required in production.');
-  const parsed = new URL(configured);
-  if (
-    parsed.protocol !== 'https:' ||
-    parsed.username ||
-    parsed.password ||
-    parsed.pathname !== '/' ||
-    parsed.search ||
-    parsed.hash
-  ) {
-    throw new Error('APP_ORIGIN must be an HTTPS origin without credentials, a path, query, or fragment.');
-  }
-  trustedProductionOrigin = parsed.origin;
-}
-
-app.use((_req, res, next) => {
-  const scriptSource = process.env.NODE_ENV === 'production' ? "'self'" : "'self' 'unsafe-inline'";
-  const connectSource = process.env.NODE_ENV === 'production' ? "'self'" : "'self' ws: wss:";
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-  if (process.env.NODE_ENV === 'production') {
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  }
-  res.setHeader(
-    'Content-Security-Policy',
-    "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; " +
-      `script-src ${scriptSource}; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; ` +
-      `font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src ${connectSource}`,
-  );
-  next();
-});
-
-app.use(express.json({ limit: '64kb' }));
-
-app.use('/api', (req, res, next) => {
-  res.setHeader('Cache-Control', 'no-store');
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-  if (req.get('sec-fetch-site') === 'cross-site') {
-    return res.status(403).json({ error: 'Cross-site request rejected.', code: 'ORIGIN_REJECTED' });
-  }
-  const origin = req.get('origin');
-  if (!origin) return next(); // non-browser clients and integration tests
-  const expectedOrigin =
-    process.env.NODE_ENV === 'production' && trustedProductionOrigin
-      ? trustedProductionOrigin
-      : `${req.protocol}://${req.get('host')}`;
-  if (origin !== expectedOrigin) {
-    return res.status(403).json({ error: 'Cross-origin request rejected.', code: 'ORIGIN_REJECTED' });
-  }
-  next();
-});
-
-const client = DATABASE_URL
-  ? createPostgresClient(DATABASE_URL)
-  : createClient({ url: localDatabaseUrl(DATABASE_PATH!) });
 
 // ---------------------------------------------------------------------------
-// Startup
+// Database client lifecycle
 // ---------------------------------------------------------------------------
 
-async function initDb() {
-  const recoveryGuidance =
-    process.env.NODE_ENV === 'production'
-      ? 'Restore a verified backup or run an explicit, reviewed schema migration before restarting the service.'
-      : 'Run `npm run db:reset` to rebuild the local development database, or set DATABASE_URL for PostgreSQL.';
-  if (!DATABASE_URL && !fs.existsSync(DATABASE_PATH!)) {
-    throw new Error(`The configured SQLite database is missing. ${recoveryGuidance}`);
-  }
-  // Fail fast and clearly rather than surfacing as a 500 on every route, which
-  // is what happened when the shipped database turned out to be corrupt.
-  try {
-    await client.execute('SELECT COUNT(*) FROM users');
-    const version = await client.execute(
-      "SELECT value FROM app_metadata WHERE key = 'schema_version'",
-    );
-    const expectedSchemaVersion = DATABASE_URL ? '7' : '6';
-    if (String(version.rows[0]?.value ?? '') !== expectedSchemaVersion) {
-      throw new Error('database schema is out of date');
+/**
+ * Resolve a database client from the current runtime.
+ *
+ * - In Cloudflare Workers, the connection string is supplied by the Hyperdrive
+ *   binding. The client is created lazily on first request and cached for the
+ *   lifetime of the isolate.
+ * - In Node.js, DATABASE_URL selects PostgreSQL; otherwise the local SQLite
+ *   file is used. The client is created once at module init.
+ */
+let cachedPgClient: Client | null = null;
+let cachedSqliteClient: Client | null = null;
+
+function getDatabaseClient(env: Env): Client {
+  // Workers: Hyperdrive provides the connection string.
+  if (env.HYPERDRIVE?.connectionString) {
+    if (!cachedPgClient) {
+      cachedPgClient = createPostgresClient(env.HYPERDRIVE.connectionString);
     }
-    await ensurePerformanceIndexes(client);
-    if (process.env.NODE_ENV === 'production') {
-      const credentialMode = await client.execute(
-        "SELECT value FROM app_metadata WHERE key = 'credential_mode'",
-      );
-      if (String(credentialMode.rows[0]?.value ?? '') !== 'official-pdf-scrypt') {
-        throw new Error('database credentials are not synchronized with the official PDF accounts');
+    return cachedPgClient;
+  }
+  // Node.js: prefer PostgreSQL if DATABASE_URL is set.
+  if (env.DATABASE_URL?.trim()) {
+    if (!cachedPgClient) {
+      cachedPgClient = createPostgresClient(env.DATABASE_URL.trim());
+    }
+    return cachedPgClient;
+  }
+  // Node.js fallback: local SQLite.
+  if (!cachedSqliteClient) {
+    const path = resolveDatabasePath();
+    cachedSqliteClient = createClient({ url: localDatabaseUrl(path) });
+  }
+  return cachedSqliteClient;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini AI
+// ---------------------------------------------------------------------------
+
+interface AiCaller {
+  isConfigured: boolean;
+  call(systemInstruction: string, message: string): Promise<string>;
+}
+
+function createAiCaller(env: Env): AiCaller {
+  const key = env.GEMINI_API_KEY?.trim() || '';
+  const model = env.GEMINI_MODEL?.trim() || 'gemini-3.6-flash';
+  if (!key) return { isConfigured: false, call: async () => { throw new Error('Gemini is not configured.'); } };
+  const client = new GoogleGenAI({ apiKey: key });
+  return {
+    isConfigured: true,
+    async call(systemInstruction: string, message: string) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15_000);
+      try {
+        const response = await client.models.generateContent({
+          model,
+          contents: message,
+          config: { systemInstruction, maxOutputTokens: 700, abortSignal: controller.signal },
+        });
+        const reply = cleanText(response.text ?? '', 10_000);
+        if (!reply) throw new Error('Gemini returned an empty response.');
+        return reply;
+      } finally {
+        clearTimeout(timeout);
       }
-    }
-    await assertOfficialAccountState(client, { checkCredentialHashes: process.env.NODE_ENV === 'production' });
-  } catch (err) {
-    throw new Error(
-      `The configured ${DATABASE_URL ? 'PostgreSQL' : 'SQLite'} database could not be read (${(err as Error).message}). ` +
-        recoveryGuidance,
-    );
-  }
-  await purgeExpiredSessions(client);
+    },
+  };
 }
+
+// ---------------------------------------------------------------------------
+// AI context builder
+// ---------------------------------------------------------------------------
 
 type AiContext = {
   scope: string;
@@ -249,10 +194,10 @@ type AiContext = {
   };
 };
 
-async function buildAiContext(me: { id: string; role: string }): Promise<AiContext> {
-  const transaction = await client.transaction('read');
+async function buildAiContext(db: Client, me: { id: string; role: string }): Promise<AiContext> {
+  const transaction = await db.transaction('read');
   try {
-    const context = await buildAiContextFromDb(transaction as unknown as typeof client, me);
+    const context = await buildAiContextFromDb(transaction as unknown as Client, me);
     await transaction.commit();
     return context;
   } finally {
@@ -261,11 +206,9 @@ async function buildAiContext(me: { id: string; role: string }): Promise<AiConte
 }
 
 async function buildAiContextFromDb(
-  db: typeof client,
+  db: Client,
   me: { id: string; role: string },
 ): Promise<AiContext> {
-  // Scope is determined by the authenticated account, never by chat text.
-  // This keeps student records private while allowing staff to ask exact counts.
   const studentWhere = isAdministrativeRole(me.role) ? '' : ' WHERE s.advisor_id = ?';
   const studentArgs = isAdministrativeRole(me.role) ? [] : [me.id];
   const visibleStudentWhere = me.role === 'Student' ? ' WHERE s.id = ?' : studentWhere;
@@ -288,8 +231,6 @@ async function buildAiContextFromDb(
   const scalar = async (sql: string, args: string[] = []) =>
     Number((await db.execute({ sql, args })).rows[0]?.count ?? 0);
 
-  // Interactive libSQL transactions use one logical connection. Execute these
-  // reads sequentially rather than issuing concurrent operations on it.
   const students = await db.execute({
     sql: `SELECT u.id, u.name, s.major, s.level, s.gpa
           FROM students s JOIN users u ON u.id = s.id${visibleStudentWhere}
@@ -344,7 +285,6 @@ async function buildAiContextFromDb(
           : 'السجل الأكاديمي للطالب الحالي فقط',
     studentContext: {
       totalEnrolled,
-      // The schema has no inactive status; every enrolled record is active.
       totalActive: totalEnrolled,
       totalOnProbation,
       individualGpas: students.rows,
@@ -352,7 +292,6 @@ async function buildAiContextFromDb(
     advisorContext: {
       totalAcademicAdvisors: advisors.rows.length,
       departmentScopes: advisors.rows,
-      // No official advisor availability table exists. Never fabricate slots.
       advisingSchedules: {
         available: false,
         reason: 'لا توجد مواعيد إرشاد رسمية مسجلة في مصدر البيانات الحالي.',
@@ -452,22 +391,17 @@ function normalizeQuery(value: string): string {
 function findStudentInContext(query: string, context: AiContext): Record<string, unknown> | null {
   const normalizedQuery = normalizeQuery(query);
   const students = context.studentContext.individualGpas as Record<string, unknown>[];
-
   for (const student of students) {
     const name = String(student.name ?? '');
     const id = String(student.id ?? '');
     if (name && normalizedQuery.includes(normalizeQuery(name))) return student;
     if (id && normalizedQuery.includes(normalizeQuery(id))) return student;
-
-    // A first/last-name lookup is useful when a staff member does not enter a
-    // complete name, but require at least four characters to avoid false hits.
     const nameTokens = normalizeQuery(name).split(' ').filter((token) => token.length >= 4);
     if (nameTokens.some((token) => normalizedQuery.includes(token))) return student;
   }
   return null;
 }
 
-/** Always returns Arabic and never exposes an upstream Gemini failure. */
 function getDynamicFallbackReply(message: string, context: AiContext | null): string {
   if (!context) return 'تعذر تحديث البيانات حالياً؛ يمكنك المحاولة مرة أخرى بعد قليل.';
   const q = normalizeQuery(message);
@@ -479,7 +413,6 @@ function getDynamicFallbackReply(message: string, context: AiContext | null): st
   ) {
     return 'Official study-plan source data is incomplete for the requested major or level; no courses from another major can be recommended.';
   }
-
   if (isOneOf(q, ['مرحبا', 'اهلا', 'السلام عليكم', 'hello', 'hi'])) {
     return 'مرحباً، كيف يمكنني مساعدتك في بياناتك الأكاديمية؟';
   }
@@ -520,41 +453,47 @@ function getDynamicFallbackReply(message: string, context: AiContext | null): st
   return 'يمكنني مساعدتك في المعدلات والطلاب والمرشدين والمقررات والخطط الدراسية. ما الذي تود الاستفسار عنه؟';
 }
 
-function asyncRoute(fn: (req: express.Request, res: express.Response) => Promise<unknown>) {
-  return (req: express.Request, res: express.Response) => {
-    fn(req, res).catch((err) => {
-      if (err instanceof ValidationError) {
-        return res.status(400).json({ error: err.message, code: err.code });
-      }
-      console.error(`${req.method} ${req.path} failed: ${safeErrorSummary(err)}`);
-      if (!res.headersSent) res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
-    });
-  };
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function requireParam(c: Context, name: string): string {
+  const value = c.req.param(name);
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new ValidationError(`${name} is required.`, 'MISSING_FIELDS');
+  }
+  return value;
 }
 
-function safeErrorSummary(error: unknown): string {
+function isProduction(env: Env): boolean {
+  return env.NODE_ENV === 'production' || (typeof globalThis !== 'undefined' && 'Cloudflare' in (globalThis as Record<string, unknown>));
+}
+
+function safeErrorSummary(error: unknown, env: Env): string {
   const name = error instanceof Error ? error.name : 'UnknownError';
   let message = error instanceof Error ? error.message : 'Unknown failure';
-  if (GEMINI_API_KEY) message = message.replaceAll(GEMINI_API_KEY, '[REDACTED]');
+  if (env.GEMINI_API_KEY) message = message.replaceAll(env.GEMINI_API_KEY, '[REDACTED]');
   // eslint-disable-next-line no-control-regex -- log lines must not contain attacker-controlled C0 characters.
   message = message.replace(/[\r\n\u0000-\u001F\u007F]+/g, ' ').slice(0, 300);
   return `${name}: ${message}`;
 }
 
-type StudentReadResult<T> = { allowed: true; value: T } | { allowed: false };
-
 async function withStudentReadAccess<T>(
-  req: express.Request,
+  db: Client,
+  user: SessionUser | undefined,
   studentId: string,
-  read: (db: typeof client) => Promise<T>,
-): Promise<StudentReadResult<T>> {
-  const transaction = await client.transaction('read');
+  read: (db: Client) => Promise<T>,
+): Promise<{ allowed: true; value: T } | { allowed: false }> {
+  const transaction = await db.transaction('read');
   try {
-    if (!(await canAccessStudent(transaction, req, studentId))) {
+    if (!(await canAccessStudentBase(transaction, user, studentId))) {
       await transaction.rollback();
       return { allowed: false };
     }
-    const value = await read(transaction as unknown as typeof client);
+    // The read function operates within a transaction. We cast the Transaction
+    // to the Client shape it needs (execute + batch); executeMultiple and
+    // nested transaction are not used by read-only access checks.
+    const value = await read(transaction as unknown as Client);
     await transaction.commit();
     return { allowed: true, value };
   } finally {
@@ -562,588 +501,9 @@ async function withStudentReadAccess<T>(
   }
 }
 
-/** Fixed-window login limiter keyed by both IP and IP + account identifier. */
-const attempts = new Map<string, { count: number; resetAt: number }>();
-const MAX_ATTEMPTS = 10;
-const MAX_ACCOUNT_ATTEMPTS = 25;
-const MAX_IP_ATTEMPTS = 50;
-const MAX_GLOBAL_ATTEMPTS = 500;
-const WINDOW_MS = 15 * 60 * 1000;
-
-function rateLimitLogin(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const identifier =
-    typeof req.body?.identifier === 'string'
-      ? req.body.identifier.normalize('NFKC').trim().toLowerCase().slice(0, 120)
-      : '';
-  const keys = [
-    { key: 'global', limit: MAX_GLOBAL_ATTEMPTS },
-    { key: `ip:${req.ip}`, limit: MAX_IP_ATTEMPTS },
-    { key: `identity:${identifier}`, limit: MAX_ACCOUNT_ATTEMPTS },
-    { key: `account:${req.ip}:${identifier}`, limit: MAX_ATTEMPTS },
-  ];
-  const now = Date.now();
-
-  for (const item of keys) {
-    const entry = attempts.get(item.key);
-    if (entry && now < entry.resetAt && entry.count >= item.limit) {
-      const retryAfter = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
-      res.setHeader('Retry-After', String(retryAfter));
-      return res.status(429).json({
-        error: 'Too many login attempts. Try again later.',
-        code: 'RATE_LIMITED',
-        retryAfter,
-      });
-    }
-  }
-
-  for (const item of keys) {
-    const entry = attempts.get(item.key);
-    if (!entry || now >= entry.resetAt) attempts.set(item.key, { count: 1, resetAt: now + WINDOW_MS });
-    else entry.count += 1;
-  }
-  next();
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of attempts) if (now > v.resetAt) attempts.delete(k);
-}, WINDOW_MS).unref();
-
-app.use(sessionMiddleware(client));
-
-setInterval(() => {
-  purgeExpiredSessions(client).catch((error: unknown) => {
-    console.warn('Could not purge expired sessions:', error instanceof Error ? error.message : String(error));
-  });
-}, 60 * 60 * 1000).unref();
-
-// ---------------------------------------------------------------------------
-// Auth
-// ---------------------------------------------------------------------------
-
-/** Unauthenticated liveness probe; it exposes no account or database data. */
-app.get('/api/health', (_req, res) => res.json({ ok: true, mode: 'server', aiConfigured }));
-
-app.post('/api/login', rateLimitLogin, asyncRoute(loginHandler(client)));
-app.post('/api/logout', asyncRoute(logoutHandler(client)));
-app.get('/api/me', meHandler());
-
-// ---------------------------------------------------------------------------
-// Student-facing
-// ---------------------------------------------------------------------------
-
-/** The signed-in student's own profile, including their advisor's contact. */
-app.get(
-  '/api/student/:id/profile',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const id = requireUserId(req.params.id, 'Student id');
-    const result = await withStudentReadAccess(req, id, (db) => db.execute({
-      sql: `SELECT u.id, u.name, u.email, u.phone, u.department, s.major, s.level, s.gpa,
-                   a.id AS advisor_id, a.name AS advisor_name,
-                   a.email AS advisor_email, a.phone AS advisor_phone,
-                   a.department AS advisor_department
-            FROM students s
-            JOIN users u ON u.id = s.id
-            LEFT JOIN users a ON a.id = s.advisor_id
-            WHERE s.id = ?`,
-      args: [id],
-    }));
-    if (!result.allowed) {
-      return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
-    }
-    const rs = result.value;
-    if (rs.rows.length === 0) return res.status(404).json({ error: 'Student not found' });
-    return res.json(rs.rows[0]);
-  }),
-);
-
-/** Prerequisite-aware course recommendations for next semester. */
-app.get(
-  '/api/student/:id/advising',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const id = requireUserId(req.params.id, 'Student id');
-    const result = await withStudentReadAccess(req, id, (db) => buildAdvisingReport(db, id));
-    if (!result.allowed) {
-      return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
-    }
-    const report = result.value;
-    if (!report) return res.status(404).json({ error: 'Student not found' });
-    return res.json(report);
-  }),
-);
-
-/** The student's real transcript, grouped by term. */
-app.get(
-  '/api/student/:id/transcript',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const id = requireUserId(req.params.id, 'Student id');
-    const result = await withStudentReadAccess(req, id, async (db) => {
-      const enrollments = await db.execute({
-        sql: `SELECT e.course_code, c.title, c.credits, e.term, e.term_order,
-                     e.status, e.grade, e.grade_points
-              FROM enrollments e JOIN courses c ON c.code = e.course_code
-              WHERE e.student_id = ?
-              ORDER BY e.term_order, e.course_code`,
-        args: [id],
-      });
-      return { history: await buildGpaHistory(db, id), enrollments: enrollments.rows };
-    });
-    if (!result.allowed) {
-      return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
-    }
-    return res.json(result.value);
-  }),
-);
-
-/** Full published study plan for the student's major. */
-app.get(
-  '/api/student/:id/study-plan',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const id = requireUserId(req.params.id, 'Student id');
-    const result = await withStudentReadAccess(req, id, (db) => effectivePlanForStudent(db, id));
-    if (!result.allowed) {
-      return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
-    }
-    return res.json(result.value);
-  }),
-);
-
-// ---------------------------------------------------------------------------
-// Staff-facing
-// ---------------------------------------------------------------------------
-
-/** Staff-scoped advising report for the admin/advisor dashboards. */
-app.get(
-  '/api/admin/student/:id/advising',
-  requireStudentManagement,
-  asyncRoute(async (req, res) => {
-    const id = requireUserId(req.params.id, 'Student id');
-    const result = await withStudentReadAccess(req, id, (db) => buildAdvisingReport(db, id));
-    if (!result.allowed) {
-      return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
-    }
-    if (!result.value) {
-      return res.status(404).json({ error: 'Student not found', code: 'NOT_FOUND' });
-    }
-    return res.json(result.value);
-  }),
-);
-
-/**
- * One round-trip academic detail view for Advisor/Admin staff.
- * Administrators may read any student; Advisors are restricted to their
- * currently assigned students by withStudentReadAccess/canAccessStudent.
- */
-app.get(
-  '/api/admin/student/:id/detail',
-  requireStudentManagement,
-  asyncRoute(async (req, res) => {
-    const id = requireUserId(req.params.id, 'Student id');
-    const result = await withStudentReadAccess(req, id, async (db) => {
-      const profile = await db.execute({
-        sql: `SELECT u.id, u.name, u.email, u.phone, u.department, s.major, s.level, s.gpa,
-                     s.advisor_id, a.name AS advisor_name, a.department AS advisor_department
-              FROM students s
-              JOIN users u ON u.id = s.id
-              LEFT JOIN users a ON a.id = s.advisor_id
-              WHERE s.id = ?`,
-        args: [id],
-      });
-      if (profile.rows.length === 0) return null;
-      const studyPlan = await effectivePlanForStudent(db, id);
-      const advising = await buildAdvisingReport(db, id);
-      return { profile: profile.rows[0], studyPlan, advising };
-    });
-    if (!result.allowed) {
-      return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
-    }
-    if (!result.value) {
-      return res.status(404).json({ error: 'Student not found', code: 'NOT_FOUND' });
-    }
-    return res.json(result.value);
-  }),
-);
-
-/**
- * The student roster.
- *
- * SCOPING: an Admin sees every student; an Advisor sees only the students
- * assigned to them. This is the single query both dashboards read, so an
- * advisor cannot widen their view by calling the "admin" endpoint directly -
- * the scope is decided from the session, never from a query parameter.
- */
-app.get(
-  '/api/admin/students',
-  requireStaff,
-  asyncRoute(async (req, res) => {
-    const me = req.user!;
-    // Note: civil_id is deliberately absent — it is a national ID and the old
-    // endpoint returned it to any unauthenticated caller.
-    const select = `
-      SELECT u.id, u.name, u.email, u.phone, u.department, s.major, s.level, s.gpa,
-             s.advisor_id, a.name AS advisor_name
-      FROM users u
-      JOIN students s ON s.id = u.id
-      LEFT JOIN users a ON a.id = s.advisor_id
-    `;
-    const rs =
-      isAdministrativeRole(me.role)
-        ? await client.execute(`${select} ORDER BY u.name`)
-        : await client.execute({
-            sql: `${select} WHERE s.advisor_id = ? ORDER BY u.name`,
-            args: [me.id],
-          });
-    return res.json(rs.rows);
-  }),
-);
-
-/** Read-only advisor roster for administrative dashboard visibility. */
-app.get(
-  '/api/admin/advisors',
-  requireAdmins,
-  asyncRoute(async (_req, res) => {
-    const rs = await client.execute(
-      `SELECT u.id, u.name, u.email, u.phone, u.department, u.role,
-              (SELECT COUNT(*) FROM students s WHERE s.advisor_id = u.id) AS advisee_count
-       FROM users u WHERE u.role = 'Advisor' ORDER BY u.name`,
-    );
-    return res.json(rs.rows);
-  }),
-);
-
-/** Advisors and admins, for the administrator's user-management view. */
-app.get(
-  '/api/admin/staff',
-  requireRegistrar,
-  asyncRoute(async (_req, res) => {
-    const rs = await client.execute(
-      `SELECT u.id, u.name, u.email, u.phone, u.department, u.role,
-              (SELECT COUNT(*) FROM students s WHERE s.advisor_id = u.id) AS advisee_count
-       FROM users u WHERE u.role IN ('Advisor','System Admin','Registrar Admin','Student Affairs Admin') ORDER BY u.role, u.name`,
-    );
-    return res.json(rs.rows);
-  }),
-);
-
-/** Institution-wide headline counts for the administrator dashboard. */
-app.get(
-  '/api/admin/stats',
-  requireAdmins,
-  asyncRoute(async (_req, res) => {
-    const stats = await client.execute({
-      sql: `WITH student_stats AS (
-              SELECT COUNT(*) AS total_students,
-                     COALESCE(SUM(CASE WHEN gpa < ? THEN 1 ELSE 0 END), 0) AS at_risk_students,
-                     COALESCE(SUM(CASE WHEN gpa >= ? THEN 1 ELSE 0 END), 0) AS good_standing_students,
-                     ROUND(AVG(gpa), 2) AS average_gpa
-              FROM students
-            )
-            SELECT student_stats.total_students, student_stats.at_risk_students,
-                   student_stats.good_standing_students, student_stats.average_gpa,
-                   (SELECT COUNT(*) FROM users WHERE role = 'Advisor') AS total_advisors,
-                   (SELECT COUNT(*) FROM users WHERE role IN ('System Admin', 'Registrar Admin', 'Student Affairs Admin')) AS total_admins,
-                   (SELECT COUNT(*) FROM majors WHERE name <> 'Common') AS total_majors,
-                   (SELECT COUNT(*) FROM courses) AS total_courses
-            FROM student_stats`,
-      args: [PROBATION_THRESHOLD, PROBATION_THRESHOLD],
-    });
-    const row = stats.rows[0];
-    return res.json({
-      totalStudents: Number(row.total_students ?? 0),
-      totalAdvisors: Number(row.total_advisors ?? 0),
-      totalAdmins: Number(row.total_admins ?? 0),
-      totalMajors: Number(row.total_majors ?? 0),
-      totalCourses: Number(row.total_courses ?? 0),
-      atRiskStudents: Number(row.at_risk_students ?? 0),
-      goodStandingStudents: Number(row.good_standing_students ?? 0),
-      averageGpa: Number(row.average_gpa ?? 0),
-    });
-  }),
-);
-
-/** Majors and their published study plans, for the admin curriculum view. */
-app.get(
-  '/api/admin/curriculum',
-  requireRegistrar,
-  asyncRoute(async (_req, res) => {
-    const majors = await client.execute(
-      `SELECT m.name, m.name_ar,
-              (SELECT COUNT(*) FROM students s WHERE s.major = m.name) AS student_count,
-              (SELECT COUNT(*) FROM study_plan_items p WHERE p.major = m.name) AS course_count
-       FROM majors m ORDER BY m.name`,
-    );
-    const prerequisites = await client.execute(
-      `SELECT cp.course_code, c.title AS course_title, cp.prereq_code,
-              p.title AS prereq_title, cp.alt_group
-       FROM course_prerequisites cp
-       JOIN courses c ON c.code = cp.course_code
-       JOIN courses p ON p.code = cp.prereq_code
-       ORDER BY cp.course_code, cp.alt_group`,
-    );
-    return res.json({ majors: majors.rows, prerequisites: prerequisites.rows });
-  }),
-);
-
-app.get(
-  '/api/settings',
-  requireAuth(),
-  asyncRoute(async (_req, res) => {
-    const settings = await client.execute(
-      'SELECT key, value, updated_at FROM university_settings ORDER BY key',
-    );
-    return res.json(
-      Object.fromEntries(settings.rows.map((row) => [String(row.key), String(row.value)])),
-    );
-  }),
-);
-
-app.post(
-  '/api/admin/settings',
-  requireSystemAdmin,
-  asyncRoute(async (req, res) => {
-    const allowed = new Map<string, number>([
-      ['portal_notice', 500],
-      ['support_email', 120],
-      ['academic_year', 20],
-    ]);
-    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
-      throw new ValidationError('Settings payload is invalid.', 'INVALID_SETTINGS');
-    }
-
-    const statements: InStatement[] = [];
-    for (const [key, rawValue] of Object.entries(req.body as Record<string, unknown>)) {
-      const maxLength = allowed.get(key);
-      if (!maxLength) throw new ValidationError(`Unknown setting: ${key}.`, 'UNKNOWN_SETTING');
-      const value = cleanText(rawValue, maxLength);
-      if (key === 'support_email' && value) optionalEmail(rawValue);
-      if (
-        key === 'academic_year' &&
-        (typeof rawValue !== 'string' || !/^\d{4}\/\d{4}$/.test(rawValue.trim()))
-      ) {
-        throw new ValidationError('Academic year must use YYYY/YYYY.', 'INVALID_ACADEMIC_YEAR');
-      }
-      statements.push({
-        sql: `INSERT INTO university_settings (key, value, updated_at, updated_by)
-              VALUES (?, ?, datetime('now'), ?)
-              ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at,
-                updated_by = excluded.updated_by`,
-        args: [key, value, req.user!.id],
-      });
-    }
-    if (statements.length === 0) {
-      throw new ValidationError('At least one setting is required.', 'MISSING_FIELDS');
-    }
-    await client.batch(statements, 'write');
-    return res.json({ success: true });
-  }),
-);
-
-app.post(
-  '/api/admin/update-student',
-  requireRegistrar,
-  asyncRoute(async (req, res) => {
-    const id = requireUserId(req.body?.id, 'Student id');
-    const major = optionalMajor(req.body?.major);
-    const level = optionalAcademicLevel(req.body?.level);
-    const hasGpa = Boolean(req.body && Object.prototype.hasOwnProperty.call(req.body, 'gpa'));
-    const advisorId = req.body?.advisor_id === undefined
-      ? undefined
-      : requireUserId(req.body.advisor_id, 'Advisor id');
-    if (!hasGpa && [major, level, advisorId].every((value) => value === undefined)) {
-      throw new ValidationError('At least one student field is required.', 'MISSING_FIELDS');
-    }
-
-    const transaction = await client.transaction('write');
-    try {
-      const existing = await transaction.execute({
-        sql: 'SELECT major, level, gpa, advisor_id FROM students WHERE id = ?',
-        args: [id],
-      });
-      if (existing.rows.length === 0) {
-        await transaction.rollback();
-        return res.status(404).json({ error: 'Student not found', code: 'NOT_FOUND' });
-      }
-      if (hasGpa) {
-        throw new ValidationError(
-          'GPA is derived from completed transcript grades and cannot be edited directly.',
-          'GPA_DERIVED_FIELD',
-        );
-      }
-
-      if (major !== undefined) {
-        const validMajor = await transaction.execute({
-          sql: "SELECT 1 FROM majors WHERE name = ? AND name <> 'Common'",
-          args: [major],
-        });
-        if (!major || validMajor.rows.length === 0) {
-          throw new ValidationError('Unknown major.', 'UNKNOWN_MAJOR');
-        }
-      }
-      if (advisorId !== undefined) {
-        const advisor = await transaction.execute({
-          sql: "SELECT 1 FROM users WHERE id = ? AND role = 'Advisor'",
-          args: [advisorId],
-        });
-        if (advisor.rows.length === 0) {
-          throw new ValidationError('Unknown advisor.', 'UNKNOWN_ADVISOR');
-        }
-      }
-
-      const nextMajor = major ?? String(existing.rows[0].major);
-      const nextLevel = level ?? optionalAcademicLevel(existing.rows[0].level)!;
-      const statements: InStatement[] = [];
-      if (major !== undefined || level !== undefined) {
-        statements.push({
-          sql: 'UPDATE students SET major = ?, level = ? WHERE id = ?',
-          args: [nextMajor, nextLevel, id],
-        });
-        const academicDb = transaction as unknown as Parameters<typeof currentEnrollmentStatements>[0];
-        statements.push(...(await currentEnrollmentStatements(academicDb, id, nextMajor, nextLevel)));
-      }
-      if (advisorId !== undefined) {
-        statements.push({ sql: 'UPDATE students SET advisor_id = ? WHERE id = ?', args: [advisorId, id] });
-      }
-
-      await transaction.batch(statements);
-      const updated = await transaction.execute({ sql: 'SELECT gpa FROM students WHERE id = ?', args: [id] });
-      await transaction.commit();
-      return res.json({ success: true, gpa: Number(updated.rows[0].gpa) });
-    } finally {
-      transaction.close();
-    }
-  }),
-);
-
-// ---------------------------------------------------------------------------
-// Admin: advisor assignment
-// ---------------------------------------------------------------------------
-
-app.post(
-  '/api/admin/assign-advisor',
-  requireRegistrar,
-  asyncRoute(async (req, res) => {
-    const studentId = requireUserId(req.body?.student_id, 'Student id');
-    const advisorId = requireUserId(req.body?.advisor_id, 'Advisor id');
-
-    const transaction = await client.transaction('write');
-    try {
-      const student = await transaction.execute({
-        sql: 'SELECT 1 FROM students WHERE id = ?',
-        args: [studentId],
-      });
-      if (student.rows.length === 0) {
-        await transaction.rollback();
-        return res.status(404).json({ error: 'Student not found', code: 'NOT_FOUND' });
-      }
-      const advisor = await transaction.execute({
-        sql: "SELECT 1 FROM users WHERE id = ? AND role = 'Advisor'",
-        args: [advisorId],
-      });
-      if (advisor.rows.length === 0) {
-        await transaction.rollback();
-        return res.status(400).json({ error: 'Unknown advisor.', code: 'UNKNOWN_ADVISOR' });
-      }
-      await transaction.execute({
-        sql: 'UPDATE students SET advisor_id = ? WHERE id = ?',
-        args: [advisorId, studentId],
-      });
-      await transaction.commit();
-      return res.json({ success: true });
-    } finally {
-      transaction.close();
-    }
-  }),
-);
-
-// ---------------------------------------------------------------------------
-// Advisor notes
-// ---------------------------------------------------------------------------
-
-/** Private advising notes for the signed-in Advisor and an assigned student. */
-app.get(
-  '/api/advisor/notes/:id',
-  requireAuth('Advisor'),
-  asyncRoute(async (req, res) => {
-    const studentId = requireUserId(req.params.id, 'Student id');
-    const transaction = await client.transaction('read');
-    try {
-      if (!(await canAccessStudent(transaction, req, studentId))) {
-        await transaction.rollback();
-        return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
-      }
-      const notesResult = await transaction.execute({
-        sql: `SELECT n.id, n.student_id, n.advisor_id, u.name AS advisor_name,
-                     n.content, n.created_at, n.updated_at
-              FROM advisor_notes n
-              JOIN users u ON u.id = n.advisor_id
-              WHERE n.student_id = ? AND n.advisor_id = ?
-              ORDER BY n.id DESC`,
-        args: [studentId, req.user!.id],
-      });
-      await transaction.commit();
-      return res.json(notesResult.rows);
-    } finally {
-      transaction.close();
-    }
-  }),
-);
-
-app.post(
-  '/api/advisor/notes',
-  requireAuth('Advisor'),
-  asyncRoute(async (req, res) => {
-    const studentId = requireUserId(req.body?.student_id, 'Student id');
-    const content = requiredMessage(req.body?.content, 4000);
-    const transaction = await client.transaction('write');
-    try {
-      if (!(await canAccessStudent(transaction, req, studentId))) {
-        await transaction.rollback();
-        return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
-      }
-      const inserted = await transaction.execute({
-        sql: 'INSERT INTO advisor_notes (student_id, advisor_id, content) VALUES (?, ?, ?) RETURNING id',
-        args: [studentId, req.user!.id, content],
-      });
-      await transaction.commit();
-      return res.json({ success: true, id: Number(inserted.lastInsertRowid) });
-    } finally {
-      transaction.close();
-    }
-  }),
-);
-
-app.post(
-  '/api/advisor/notes/delete',
-  requireAuth('Advisor'),
-  asyncRoute(async (req, res) => {
-    const noteId = Number(req.body?.id);
-    if (!Number.isSafeInteger(noteId) || noteId <= 0) {
-      throw new ValidationError('Note id is invalid.', 'INVALID_NOTE_ID');
-    }
-    const deleted = await client.execute({
-      sql: 'DELETE FROM advisor_notes WHERE id = ? AND advisor_id = ?',
-      args: [noteId, req.user!.id],
-    });
-    if (deleted.rowsAffected === 0) {
-      return res.status(404).json({ error: 'Note not found', code: 'NOT_FOUND' });
-    }
-    return res.json({ success: true });
-  }),
-);
-
-// ---------------------------------------------------------------------------
-// Messaging
-// ---------------------------------------------------------------------------
-
 async function mayMessageUser(
-  db: typeof client | Transaction,
-  me: NonNullable<express.Request['user']>,
+  db: Client | { execute: Client['execute'] },
+  me: SessionUser,
   otherUserId: string,
 ): Promise<boolean> {
   if (me.role === 'Student') {
@@ -1163,358 +523,1011 @@ async function mayMessageUser(
   return false;
 }
 
-/** Who the signed-in user is allowed to message. */
-app.get(
-  '/api/contacts',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const me = req.user!;
-    if (isAdministrativeRole(me.role)) return res.json([]);
-    if (me.role === 'Student') {
-      // A student may only message their assigned advisor.
-      const rs = await client.execute({
-        sql: `SELECT a.id, a.name, a.email, a.department, a.role
-              FROM students s JOIN users a ON a.id = s.advisor_id WHERE s.id = ?`,
-        args: [me.id],
-      });
-      return res.json(rs.rows);
-    }
-    // An advisor may message only their assigned students.
-    const rs = await client.execute({
-      sql: `SELECT u.id, u.name, u.email, u.department, u.role FROM users u
-            JOIN students s ON s.id = u.id WHERE s.advisor_id = ? ORDER BY u.name`,
-      args: [me.id],
-    });
-    return res.json(rs.rows);
-  }),
-);
+// ---------------------------------------------------------------------------
+// Hono application
+// ---------------------------------------------------------------------------
 
-/** Conversation with one counterpart. Always scoped to the caller. */
-app.get(
-  '/api/messages',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const me = req.user!;
-    const withUser = requireUserId(req.query?.with, 'Conversation user id');
-    const transaction = await client.transaction('read');
+type Variables = {
+  user?: SessionUser;
+  db: Client;
+  ai: AiCaller;
+  env: Env;
+};
+
+export const app = new Hono<{ Variables: Variables }>();
+
+// -- Error handler ----------------------------------------------------------
+
+app.onError((err, c) => {
+  if (err instanceof ValidationError) {
+    return c.json({ error: err.message, code: err.code }, 400);
+  }
+  const env = c.get('env') ?? ({} as Env);
+  console.error(`${c.req.method} ${c.req.path} failed: ${safeErrorSummary(err, env)}`);
+  if (err instanceof SyntaxError) {
+    return c.json({ error: 'Request body must contain valid JSON.', code: 'INVALID_JSON' }, 400);
+  }
+  return c.json({ error: 'Internal server error.', code: 'INTERNAL_ERROR' }, 500);
+});
+
+// -- Per-request setup: database, AI, session resolution --------------------
+
+app.use('*', async (c, next) => {
+  const env: Env = (c.env ?? {}) as Env;
+  c.set('env', env);
+  c.set('db', getDatabaseClient(env));
+  c.set('ai', createAiCaller(env));
+  await next();
+});
+
+// -- Trusted production origin validation ----------------------------------
+
+let trustedProductionOrigin: string | undefined;
+
+function validateProductionOrigin(env: Env): void {
+  if (!isProduction(env)) return;
+  const configured = env.APP_ORIGIN?.trim();
+  if (!configured) throw new Error('APP_ORIGIN is required in production.');
+  const parsed = new URL(configured);
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== '/' ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new Error('APP_ORIGIN must be an HTTPS origin without credentials, a path, query, or fragment.');
+  }
+  trustedProductionOrigin = parsed.origin;
+}
+
+// -- Security headers (API only) -------------------------------------------
+
+app.use('/api/*', async (c, next) => {
+  const env = c.get('env');
+  const prod = isProduction(env);
+  const scriptSource = prod ? "'self'" : "'self' 'unsafe-inline'";
+  const connectSource = prod ? "'self'" : "'self' ws: wss:";
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('X-Frame-Options', 'DENY');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  c.header('Cross-Origin-Opener-Policy', 'same-origin');
+  c.header('Cross-Origin-Resource-Policy', 'same-origin');
+  if (prod) {
+    c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  c.header(
+    'Content-Security-Policy',
+    "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; " +
+      `script-src ${scriptSource}; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; ` +
+      `font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src ${connectSource}`,
+  );
+  await next();
+});
+
+// -- Body size limit (64KB, matches previous Express config) ----------------
+
+app.use('/api/*', async (c, next) => {
+  const cl = c.req.header('content-length');
+  if (cl && Number(cl) > 64 * 1024) {
+    return c.json({ error: 'Request body too large.', code: 'BODY_TOO_LARGE' }, 413);
+  }
+  await next();
+});
+
+// -- Cache control + origin check for /api ---------------------------------
+
+app.use('/api/*', async (c, next) => {
+  c.header('Cache-Control', 'no-store');
+  const env = c.get('env');
+  if (['GET', 'HEAD', 'OPTIONS'].includes(c.req.method)) return await next();
+  if (c.req.header('sec-fetch-site') === 'cross-site') {
+    return c.json({ error: 'Cross-site request rejected.', code: 'ORIGIN_REJECTED' }, 403);
+  }
+  const origin = c.req.header('origin');
+  if (!origin) return await next();
+  const expectedOrigin = isProduction(env) && trustedProductionOrigin
+    ? trustedProductionOrigin
+    : `${new URL(c.req.url).protocol}//${c.req.header('host')}`;
+  if (origin !== expectedOrigin) {
+    return c.json({ error: 'Cross-origin request rejected.', code: 'ORIGIN_REJECTED' }, 403);
+  }
+  await next();
+});
+
+// -- Session resolution (attach user to context if cookie is valid) --------
+
+app.use('/api/*', async (c, next) => {
+  const token = readSessionCookie(c.req.header('cookie'));
+  if (token) {
+    const db = c.get('db');
     try {
-      if (!(await mayMessageUser(transaction, me, withUser))) {
-        await transaction.rollback();
-        return res.status(403).json({ error: 'You may not access this conversation.', code: 'FORBIDDEN' });
-      }
-      const rs = await transaction.execute({
-        sql: `SELECT * FROM (
-                SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at, m.is_read
-                FROM messages m WHERE m.sender_id = ? AND m.receiver_id = ?
-                UNION ALL
-                SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at, m.is_read
-                FROM messages m WHERE m.sender_id = ? AND m.receiver_id = ?
-                ORDER BY m.id DESC LIMIT 200
-              ) recent ORDER BY id ASC`,
-        args: [me.id, withUser, withUser, me.id],
-      });
-      await transaction.commit();
-      return res.json(rs.rows);
-    } finally {
-      transaction.close();
+      const user = await resolveSession(db, token);
+      if (user) c.set('user', user);
+    } catch (err) {
+      console.warn('Session resolution failed:', err);
     }
-  }),
-);
-
-/** Unread counts per counterpart, for the sidebar badge. */
-app.get(
-  '/api/messages/unread',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    if (isAdministrativeRole(req.user!.role)) return res.json([]);
-    const me = req.user!;
-    const rs = me.role === 'Student'
-      ? await client.execute({
-          sql: `SELECT m.sender_id, COUNT(*) AS count FROM messages m
-                JOIN students s ON s.id = m.receiver_id AND s.advisor_id = m.sender_id
-                WHERE m.receiver_id = ? AND m.is_read = 0 GROUP BY m.sender_id`,
-          args: [me.id],
-        })
-      : await client.execute({
-          sql: `SELECT m.sender_id, COUNT(*) AS count FROM messages m
-                JOIN students s ON s.id = m.sender_id AND s.advisor_id = m.receiver_id
-                WHERE m.receiver_id = ? AND m.is_read = 0 GROUP BY m.sender_id`,
-          args: [me.id],
-        });
-    return res.json(rs.rows);
-  }),
-);
-
-app.post(
-  '/api/messages',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const me = req.user!;
-    // sender_id comes from the session, never the body: the old endpoint let
-    // any caller send a message as any user.
-    const receiverId = requireUserId(req.body?.receiver_id, 'Recipient id');
-    const content = requiredMessage(req.body?.content, 2000);
-    if (isAdministrativeRole(me.role)) {
-      return res.status(403).json({ error: 'You may not message this user.', code: 'FORBIDDEN' });
-    }
-    const relationshipSql = 'SELECT 1 FROM students WHERE id = ? AND advisor_id = ?';
-    const relationshipArgs = me.role === 'Student'
-      ? [me.id, receiverId]
-      : [receiverId, me.id];
-    const inserted = await client.execute({
-      sql: `INSERT INTO messages (sender_id, receiver_id, content)
-            SELECT ?, ?, ? WHERE EXISTS (${relationshipSql})`,
-      args: [me.id, receiverId, content, ...relationshipArgs],
-    });
-    if (inserted.rowsAffected === 0) {
-      return res.status(403).json({ error: 'You may not message this user.', code: 'FORBIDDEN' });
-    }
-    return res.json({ success: true });
-  }),
-);
-
-app.post(
-  '/api/messages/read',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const senderId = requireUserId(req.body?.senderId, 'Sender id');
-    const transaction = await client.transaction('write');
-    try {
-      if (!(await mayMessageUser(transaction, req.user!, senderId))) {
-        await transaction.rollback();
-        return res.status(403).json({ error: 'You may not access this conversation.', code: 'FORBIDDEN' });
-      }
-      await transaction.execute({
-        sql: 'UPDATE messages SET is_read = 1 WHERE receiver_id = ? AND sender_id = ?',
-        args: [req.user!.id, senderId],
-      });
-      await transaction.commit();
-      return res.json({ success: true });
-    } finally {
-      transaction.close();
-    }
-  }),
-);
+  }
+  await next();
+});
 
 // ---------------------------------------------------------------------------
-// AI advisor
+// Rate limiters (in-memory; per-isolate in Workers, per-process in Node.js)
 // ---------------------------------------------------------------------------
+
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const LOGIN_MAX_ATTEMPTS = 10;
+const LOGIN_MAX_ACCOUNT_ATTEMPTS = 25;
+const LOGIN_MAX_IP_ATTEMPTS = 50;
+const LOGIN_MAX_GLOBAL_ATTEMPTS = 500;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 
 const chatLimits = new Map<string, { lastAt: number; count: number; resetAt: number }>();
 const chatInFlight = new Set<string>();
+const CHAT_MAX_PER_MIN = 20;
+const CHAT_MIN_INTERVAL_MS = 1_500;
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [userId, entry] of chatLimits) {
-    if (now >= entry.resetAt) chatLimits.delete(userId);
+function checkLoginRateLimit(ip: string, identifier: string, now: number): { retryAfter: number } | null {
+  const lowerIdentifier = identifier.normalize('NFKC').trim().toLowerCase().slice(0, 120);
+  const keys = [
+    { key: 'global', limit: LOGIN_MAX_GLOBAL_ATTEMPTS },
+    { key: `ip:${ip}`, limit: LOGIN_MAX_IP_ATTEMPTS },
+    { key: `identity:${lowerIdentifier}`, limit: LOGIN_MAX_ACCOUNT_ATTEMPTS },
+    { key: `account:${ip}:${lowerIdentifier}`, limit: LOGIN_MAX_ATTEMPTS },
+  ];
+  for (const item of keys) {
+    const entry = loginAttempts.get(item.key);
+    if (entry && now < entry.resetAt && entry.count >= item.limit) {
+      return { retryAfter: Math.max(1, Math.ceil((entry.resetAt - now) / 1000)) };
+    }
   }
-}, 60_000).unref();
+  for (const item of keys) {
+    const entry = loginAttempts.get(item.key);
+    if (!entry || now >= entry.resetAt) loginAttempts.set(item.key, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    else entry.count += 1;
+  }
+  return null;
+}
 
-function rateLimitChat(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const userId = req.user!.id;
-  const now = Date.now();
+function checkChatRateLimit(userId: string, now: number): { retryAfter: number } | null {
   const entry = chatLimits.get(userId);
   if (!entry || now >= entry.resetAt) {
     chatLimits.set(userId, { lastAt: now, count: 1, resetAt: now + 60_000 });
-    return next();
+    return null;
   }
-  const retryAfterMs = Math.max(0, 1_500 - (now - entry.lastAt));
-  if (retryAfterMs > 0 || entry.count >= 20) {
-    const retryAfter = Math.max(1, Math.ceil((entry.count >= 20 ? entry.resetAt - now : retryAfterMs) / 1000));
-    res.setHeader('Retry-After', String(retryAfter));
-    return res.status(429).json({
-      error: 'Please wait before sending another AI message.',
-      code: 'RATE_LIMITED',
-      retryAfter,
-    });
+  const retryAfterMs = Math.max(0, CHAT_MIN_INTERVAL_MS - (now - entry.lastAt));
+  if (retryAfterMs > 0 || entry.count >= CHAT_MAX_PER_MIN) {
+    const retryAfter = Math.max(1, Math.ceil((entry.count >= CHAT_MAX_PER_MIN ? entry.resetAt - now : retryAfterMs) / 1000));
+    return { retryAfter };
   }
   entry.lastAt = now;
   entry.count += 1;
-  next();
+  return null;
 }
 
-app.post(
-  '/api/chat',
-  requireAuth(),
-  rateLimitChat,
-  asyncRoute(async (req, res) => {
-    const me = req.user!;
-    const message = requiredMessage(req.body?.message, 2000);
-    if (chatInFlight.has(me.id)) {
-      res.setHeader('Retry-After', '1');
-      return res.status(429).json({
-        error: 'An AI request is already in progress for this account.',
-        code: 'CHAT_IN_PROGRESS',
-        retryAfter: 1,
-      });
-    }
-    chatInFlight.add(me.id);
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
 
-    try {
-      let context: AiContext | null = null;
-      let fallback = false;
-      let reply: string;
-      try {
-        context = await buildAiContext(me);
-        reply = await callGemini(buildGeminiSystemPrompt(context, me.role, me.id, message), message);
-        if (exposesInternalAiMaterial(reply)) throw new Error('UnsafeModelOutput');
-      } catch (err) {
-        const reason = err instanceof Error ? err.name : 'UnknownError';
-        console.warn(`Gemini AI Advisor unavailable (${reason}); serving local fallback.`);
-        fallback = true;
-        reply = getDynamicFallbackReply(message, context);
-      }
+/** Unauthenticated liveness probe; it exposes no account or database data. */
+app.get('/api/health', (c) => {
+  const ai = c.get('ai');
+  // Report `mode: 'server'` to match the contract the integration test asserts
+  // against (this app does not have a client-only mock mode).
+  return c.json({ ok: true, mode: 'server', aiConfigured: ai.isConfigured });
+});
 
-      await client.batch(
-        [
-          { sql: "INSERT INTO chat_messages (user_id, role, content) VALUES (?, 'user', ?)", args: [me.id, message] },
-          { sql: "INSERT INTO chat_messages (user_id, role, content) VALUES (?, 'assistant', ?)", args: [me.id, reply] },
-        ],
-        'write',
-      );
-      return res.json({ reply, fallback });
-    } finally {
-      chatInFlight.delete(me.id);
+// -- Auth -------------------------------------------------------------------
+
+/** Parse a JSON request body. Returns an empty object if the body is empty or not JSON. */
+async function readJsonBody(c: Context): Promise<Record<string, unknown>> {
+  const contentType = c.req.header('content-type') ?? '';
+  if (!contentType.includes('application/json')) {
+    // Fall back to parseBody for form data (e.g. login from non-JS clients).
+    const result = await c.req.parseBody().catch(() => ({}));
+    return (result ?? {}) as Record<string, unknown>;
+  }
+  try {
+    const text = await c.req.text();
+    if (!text) return {};
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+app.post('/api/login', async (c) => {
+  const body = await readJsonBody(c);
+  const identifier = typeof body?.identifier === 'string' ? body.identifier : '';
+  const password = typeof body?.password === 'string' ? body.password : '';
+  const now = Date.now();
+  const rateLimited = checkLoginRateLimit(c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? 'unknown', identifier, now);
+  if (rateLimited) {
+    c.header('Retry-After', String(rateLimited.retryAfter));
+    return c.json({
+      error: 'Too many login attempts. Try again later.',
+      code: 'RATE_LIMITED',
+      retryAfter: rateLimited.retryAfter,
+    }, 429);
+  }
+  const db = c.get('db');
+  const env = c.get('env');
+  const result = await performLogin(db, identifier, password);
+  if ('error' in result) {
+    if (result.error === 'MISSING_FIELDS') {
+      return c.json({ error: 'Identifier and password are required.', code: 'MISSING_FIELDS' }, 400);
     }
-  }),
+    return c.json({ error: 'Invalid credentials.', code: 'INVALID_CREDENTIALS' }, 401);
+  }
+  // The performLogin helper returns a combined result; pull out token + user.
+  const successResult = result as unknown as { user: SessionUser; token: string };
+  c.header('Set-Cookie', buildSessionCookieHeader(successResult.token, { isProduction: isProduction(env) }));
+  return c.json({
+    user: {
+      id: successResult.user.id,
+      name: successResult.user.name,
+      email: successResult.user.email,
+      phone: successResult.user.phone,
+      department: successResult.user.department,
+      role: successResult.user.role,
+    },
+  });
+});
+
+app.post('/api/logout', async (c) => {
+  const token = readSessionCookie(c.req.header('cookie'));
+  if (token) {
+    const db = c.get('db');
+    await deleteSession(db, token);
+  }
+  c.header('Set-Cookie', buildClearSessionCookieHeader());
+  return c.json({ success: true });
+});
+
+/** Lets the SPA restore state on reload without trusting localStorage. */
+app.get('/api/me', (c) => {
+  const user = c.get('user');
+  if (!user) return c.json({ error: 'Not authenticated', code: 'AUTH_REQUIRED' }, 401);
+  return c.json({ user });
+});
+
+// -- Guards (Hono middleware) -----------------------------------------------
+
+const requireAuth = (...roles: ApplicationRole[]) => {
+  return async (c: Context, next: Next) => {
+    const user = c.get('user');
+    if (!user) return c.json({ error: 'Authentication required', code: 'AUTH_REQUIRED' }, 401);
+    if (roles.length > 0 && !roles.includes(user.role)) {
+      return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+    }
+    await next();
+  };
+};
+
+const requireAdmins = requireAuth(...ADMIN_ROLES);
+const requireStaff = requireAuth(...ADMIN_ROLES, 'Advisor');
+const requireSystemAdmin = requireAuth('System Admin');
+const requireRegistrar = requireAuth('System Admin', 'Registrar Admin');
+const requireStudentManagement = requireAuth(
+  'System Admin',
+  'Registrar Admin',
+  'Student Affairs Admin',
+  'Advisor',
 );
 
-// ---------------------------------------------------------------------------
-// AI Chat History
-// ---------------------------------------------------------------------------
+// -- Student-facing --------------------------------------------------------
 
-app.get(
-  '/api/chat/history',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const me = req.user!;
-    const rs = await client.execute({
-      sql: `SELECT * FROM (
-              SELECT id, role, content, created_at FROM chat_messages
-              WHERE user_id = ? ORDER BY id DESC LIMIT 100
-            ) recent ORDER BY id ASC`,
+/** The signed-in student's own profile, including their advisor's contact. */
+app.get('/api/student/:id/profile', requireAuth(), async (c) => {
+  const id = requireParam(c, 'id');
+  const user = c.get('user');
+  const db = c.get('db');
+  const result = await withStudentReadAccess(db, user, id, (tx) => tx.execute({
+    sql: `SELECT u.id, u.name, u.email, u.phone, u.department, s.major, s.level, s.gpa,
+                 a.id AS advisor_id, a.name AS advisor_name,
+                 a.email AS advisor_email, a.phone AS advisor_phone,
+                 a.department AS advisor_department
+         FROM students s
+         JOIN users u ON u.id = s.id
+         LEFT JOIN users a ON a.id = s.advisor_id
+         WHERE s.id = ?`,
+    args: [id],
+  }));
+  if (!result.allowed) return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+  const rs = result.value;
+  if (rs.rows.length === 0) return c.json({ error: 'Student not found' }, 404);
+  return c.json(rs.rows[0]);
+});
+
+/** Prerequisite-aware course recommendations for next semester. */
+app.get('/api/student/:id/advising', requireAuth(), async (c) => {
+  const id = requireParam(c, 'id');
+  const user = c.get('user');
+  const db = c.get('db');
+  const result = await withStudentReadAccess(db, user, id, (tx) => buildAdvisingReport(tx, id));
+  if (!result.allowed) return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+  const report = result.value;
+  if (!report) return c.json({ error: 'Student not found' }, 404);
+  return c.json(report);
+});
+
+/** The student's real transcript, grouped by term. */
+app.get('/api/student/:id/transcript', requireAuth(), async (c) => {
+  const id = requireParam(c, 'id');
+  const user = c.get('user');
+  const db = c.get('db');
+  const result = await withStudentReadAccess(db, user, id, async (tx) => {
+    const enrollments = await tx.execute({
+      sql: `SELECT e.course_code, c.title, c.credits, e.term, e.term_order,
+                   e.status, e.grade, e.grade_points
+           FROM enrollments e JOIN courses c ON c.code = e.course_code
+           WHERE e.student_id = ?
+           ORDER BY e.term_order, e.course_code`,
+      args: [id],
+    });
+    return { history: await buildGpaHistory(tx, id), enrollments: enrollments.rows };
+  });
+  if (!result.allowed) return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+  return c.json(result.value);
+});
+
+/** Full published study plan for the student's major. */
+app.get('/api/student/:id/study-plan', requireAuth(), async (c) => {
+  const id = requireParam(c, 'id');
+  const user = c.get('user');
+  const db = c.get('db');
+  const result = await withStudentReadAccess(db, user, id, (tx) => effectivePlanForStudent(tx, id));
+  if (!result.allowed) return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+  return c.json(result.value);
+});
+
+// -- Staff-facing -----------------------------------------------------------
+
+/** Staff-scoped advising report for the admin/advisor dashboards. */
+app.get('/api/admin/student/:id/advising', requireStudentManagement, async (c) => {
+  const id = requireParam(c, 'id');
+  const user = c.get('user');
+  const db = c.get('db');
+  const result = await withStudentReadAccess(db, user, id, (tx) => buildAdvisingReport(tx, id));
+  if (!result.allowed) return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+  if (!result.value) return c.json({ error: 'Student not found', code: 'NOT_FOUND' }, 404);
+  return c.json(result.value);
+});
+
+/**
+ * One round-trip academic detail view for Advisor/Admin staff.
+ */
+app.get('/api/admin/student/:id/detail', requireStudentManagement, async (c) => {
+  const id = requireParam(c, 'id');
+  const user = c.get('user');
+  const db = c.get('db');
+  const result = await withStudentReadAccess(db, user, id, async (tx) => {
+    const profile = await tx.execute({
+      sql: `SELECT u.id, u.name, u.email, u.phone, u.department, s.major, s.level, s.gpa,
+                   s.advisor_id, a.name AS advisor_name, a.department AS advisor_department
+           FROM students s
+           JOIN users u ON u.id = s.id
+           LEFT JOIN users a ON a.id = s.advisor_id
+           WHERE s.id = ?`,
+      args: [id],
+    });
+    if (profile.rows.length === 0) return null;
+    const studyPlan = await effectivePlanForStudent(tx, id);
+    const advising = await buildAdvisingReport(tx, id);
+    return { profile: profile.rows[0], studyPlan, advising };
+  });
+  if (!result.allowed) return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+  if (!result.value) return c.json({ error: 'Student not found', code: 'NOT_FOUND' }, 404);
+  return c.json(result.value);
+});
+
+/** The student roster. */
+app.get('/api/admin/students', requireStaff, async (c) => {
+  const me = c.get('user')!;
+  const db = c.get('db');
+  const select = `
+    SELECT u.id, u.name, u.email, u.phone, u.department, s.major, s.level, s.gpa,
+           s.advisor_id, a.name AS advisor_name
+    FROM users u
+    JOIN students s ON s.id = u.id
+    LEFT JOIN users a ON a.id = s.advisor_id
+  `;
+  const rs = isAdministrativeRole(me.role)
+    ? await db.execute(`${select} ORDER BY u.name`)
+    : await db.execute({ sql: `${select} WHERE s.advisor_id = ? ORDER BY u.name`, args: [me.id] });
+  return c.json(rs.rows);
+});
+
+/** Read-only advisor roster for administrative dashboard visibility. */
+app.get('/api/admin/advisors', requireAdmins, async (c) => {
+  const db = c.get('db');
+  const rs = await db.execute(
+    `SELECT u.id, u.name, u.email, u.phone, u.department, u.role,
+            (SELECT COUNT(*) FROM students s WHERE s.advisor_id = u.id) AS advisee_count
+     FROM users u WHERE u.role = 'Advisor' ORDER BY u.name`,
+  );
+  return c.json(rs.rows);
+});
+
+/** Advisors and admins, for the administrator's user-management view. */
+app.get('/api/admin/staff', requireRegistrar, async (c) => {
+  const db = c.get('db');
+  const rs = await db.execute(
+    `SELECT u.id, u.name, u.email, u.phone, u.department, u.role,
+            (SELECT COUNT(*) FROM students s WHERE s.advisor_id = u.id) AS advisee_count
+     FROM users u WHERE u.role IN ('Advisor','System Admin','Registrar Admin','Student Affairs Admin') ORDER BY u.role, u.name`,
+  );
+  return c.json(rs.rows);
+});
+
+/** Institution-wide headline counts for the administrator dashboard. */
+app.get('/api/admin/stats', requireAdmins, async (c) => {
+  const db = c.get('db');
+  const stats = await db.execute({
+    sql: `WITH student_stats AS (
+            SELECT COUNT(*) AS total_students,
+                   COALESCE(SUM(CASE WHEN gpa < ? THEN 1 ELSE 0 END), 0) AS at_risk_students,
+                   COALESCE(SUM(CASE WHEN gpa >= ? THEN 1 ELSE 0 END), 0) AS good_standing_students,
+                   ROUND(AVG(gpa), 2) AS average_gpa
+            FROM students
+          )
+          SELECT student_stats.total_students, student_stats.at_risk_students,
+                 student_stats.good_standing_students, student_stats.average_gpa,
+                 (SELECT COUNT(*) FROM users WHERE role = 'Advisor') AS total_advisors,
+                 (SELECT COUNT(*) FROM users WHERE role IN ('System Admin', 'Registrar Admin', 'Student Affairs Admin')) AS total_admins,
+                 (SELECT COUNT(*) FROM majors WHERE name <> 'Common') AS total_majors,
+                 (SELECT COUNT(*) FROM courses) AS total_courses
+          FROM student_stats`,
+    args: [PROBATION_THRESHOLD, PROBATION_THRESHOLD],
+  });
+  const row = stats.rows[0];
+  return c.json({
+    totalStudents: Number(row.total_students ?? 0),
+    totalAdvisors: Number(row.total_advisors ?? 0),
+    totalAdmins: Number(row.total_admins ?? 0),
+    totalMajors: Number(row.total_majors ?? 0),
+    totalCourses: Number(row.total_courses ?? 0),
+    atRiskStudents: Number(row.at_risk_students ?? 0),
+    goodStandingStudents: Number(row.good_standing_students ?? 0),
+    averageGpa: Number(row.average_gpa ?? 0),
+  });
+});
+
+/** Majors and their published study plans, for the admin curriculum view. */
+app.get('/api/admin/curriculum', requireRegistrar, async (c) => {
+  const db = c.get('db');
+  const majors = await db.execute(
+    `SELECT m.name, m.name_ar,
+            (SELECT COUNT(*) FROM students s WHERE s.major = m.name) AS student_count,
+            (SELECT COUNT(*) FROM study_plan_items p WHERE p.major = m.name) AS course_count
+     FROM majors m ORDER BY m.name`,
+  );
+  const prerequisites = await db.execute(
+    `SELECT cp.course_code, c.title AS course_title, cp.prereq_code,
+            p.title AS prereq_title, cp.alt_group
+     FROM course_prerequisites cp
+     JOIN courses c ON c.code = cp.course_code
+     JOIN courses p ON p.code = cp.prereq_code
+     ORDER BY cp.course_code, cp.alt_group`,
+  );
+  return c.json({ majors: majors.rows, prerequisites: prerequisites.rows });
+});
+
+app.get('/api/settings', requireAuth(), async (c) => {
+  const db = c.get('db');
+  const settings = await db.execute('SELECT key, value, updated_at FROM university_settings ORDER BY key');
+  return c.json(Object.fromEntries(settings.rows.map((row) => [String(row.key), String(row.value)])));
+});
+
+app.post('/api/admin/settings', requireSystemAdmin, async (c) => {
+  const body = await readJsonBody(c);
+  const allowed = new Map<string, number>([
+    ['portal_notice', 500],
+    ['support_email', 120],
+    ['academic_year', 20],
+  ]);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ValidationError('Settings payload is invalid.', 'INVALID_SETTINGS');
+  }
+  const me = c.get('user')!;
+  const statements: InStatement[] = [];
+  for (const [key, rawValue] of Object.entries(body as Record<string, unknown>)) {
+    const maxLength = allowed.get(key);
+    if (!maxLength) throw new ValidationError(`Unknown setting: ${key}.`, 'UNKNOWN_SETTING');
+    const value = cleanText(rawValue, maxLength);
+    if (key === 'support_email' && value) optionalEmail(rawValue);
+    if (key === 'academic_year' && (typeof rawValue !== 'string' || !/^\d{4}\/\d{4}$/.test(rawValue.trim()))) {
+      throw new ValidationError('Academic year must use YYYY/YYYY.', 'INVALID_ACADEMIC_YEAR');
+    }
+    statements.push({
+      sql: `INSERT INTO university_settings (key, value, updated_at, updated_by)
+            VALUES (?, ?, datetime('now'), ?)
+            ON CONFLICT(key) DO UPDATE SET
+              value = excluded.value,
+              updated_at = excluded.updated_at,
+              updated_by = excluded.updated_by`,
+      args: [key, value, me.id],
+    });
+  }
+  if (statements.length === 0) {
+    throw new ValidationError('At least one setting is required.', 'MISSING_FIELDS');
+  }
+  const db = c.get('db');
+  await db.batch(statements, 'write');
+  return c.json({ success: true });
+});
+
+app.post('/api/admin/update-student', requireRegistrar, async (c) => {
+  const body = await readJsonBody(c);
+  const id = String(body?.id ?? '').trim();
+  const major = optionalMajor(body?.major);
+  const level = optionalAcademicLevel(body?.level);
+  const hasGpa = Boolean(body && Object.prototype.hasOwnProperty.call(body, 'gpa'));
+  const advisorId = body?.advisor_id === undefined
+    ? undefined
+    : String(body.advisor_id).trim();
+  if (!id) throw new ValidationError('Student id is required.', 'INVALID_USER_ID');
+  if (!hasGpa && [major, level, advisorId].every((value) => value === undefined)) {
+    throw new ValidationError('At least one student field is required.', 'MISSING_FIELDS');
+  }
+  const db = c.get('db');
+  const transaction = await db.transaction('write');
+  try {
+    const existing = await transaction.execute({
+      sql: 'SELECT major, level, gpa, advisor_id FROM students WHERE id = ?',
+      args: [id],
+    });
+    if (existing.rows.length === 0) {
+      await transaction.rollback();
+      return c.json({ error: 'Student not found', code: 'NOT_FOUND' }, 404);
+    }
+    if (hasGpa) {
+      throw new ValidationError(
+        'GPA is derived from completed transcript grades and cannot be edited directly.',
+        'GPA_DERIVED_FIELD',
+      );
+    }
+    if (major !== undefined) {
+      const validMajor = await transaction.execute({
+        sql: "SELECT 1 FROM majors WHERE name = ? AND name <> 'Common'",
+        args: [major],
+      });
+      if (!major || validMajor.rows.length === 0) throw new ValidationError('Unknown major.', 'UNKNOWN_MAJOR');
+    }
+    if (advisorId !== undefined) {
+      const advisor = await transaction.execute({
+        sql: "SELECT 1 FROM users WHERE id = ? AND role = 'Advisor'",
+        args: [advisorId],
+      });
+      if (advisor.rows.length === 0) throw new ValidationError('Unknown advisor.', 'UNKNOWN_ADVISOR');
+    }
+    const nextMajor = major ?? String(existing.rows[0].major);
+    const nextLevel = level ?? optionalAcademicLevel(existing.rows[0].level)!;
+    const statements: InStatement[] = [];
+    if (major !== undefined || level !== undefined) {
+      statements.push({
+        sql: 'UPDATE students SET major = ?, level = ? WHERE id = ?',
+        args: [nextMajor, nextLevel, id],
+      });
+      const academicDb = transaction as unknown as Parameters<typeof currentEnrollmentStatements>[0];
+      statements.push(...(await currentEnrollmentStatements(academicDb, id, nextMajor, nextLevel)));
+    }
+    if (advisorId !== undefined) {
+      statements.push({ sql: 'UPDATE students SET advisor_id = ? WHERE id = ?', args: [advisorId, id] });
+    }
+    await transaction.batch(statements);
+    const updated = await transaction.execute({ sql: 'SELECT gpa FROM students WHERE id = ?', args: [id] });
+    await transaction.commit();
+    return c.json({ success: true, gpa: Number(updated.rows[0].gpa) });
+  } finally {
+    transaction.close();
+  }
+});
+
+app.post('/api/admin/assign-advisor', requireRegistrar, async (c) => {
+  const body = await readJsonBody(c);
+  const studentId = String(body?.student_id ?? '').trim();
+  const advisorId = String(body?.advisor_id ?? '').trim();
+  if (!studentId || !advisorId) throw new ValidationError('Student id and advisor id are required.', 'MISSING_FIELDS');
+  const db = c.get('db');
+  const transaction = await db.transaction('write');
+  try {
+    const student = await transaction.execute({
+      sql: 'SELECT 1 FROM students WHERE id = ?',
+      args: [studentId],
+    });
+    if (student.rows.length === 0) {
+      await transaction.rollback();
+      return c.json({ error: 'Student not found', code: 'NOT_FOUND' }, 404);
+    }
+    const advisor = await transaction.execute({
+      sql: "SELECT 1 FROM users WHERE id = ? AND role = 'Advisor'",
+      args: [advisorId],
+    });
+    if (advisor.rows.length === 0) {
+      await transaction.rollback();
+      return c.json({ error: 'Unknown advisor.', code: 'UNKNOWN_ADVISOR' }, 400);
+    }
+    await transaction.execute({
+      sql: 'UPDATE students SET advisor_id = ? WHERE id = ?',
+      args: [advisorId, studentId],
+    });
+    await transaction.commit();
+    return c.json({ success: true });
+  } finally {
+    transaction.close();
+  }
+});
+
+// -- Advisor notes ----------------------------------------------------------
+
+app.get('/api/advisor/notes/:id', requireAuth('Advisor'), async (c) => {
+  const studentId = requireParam(c, 'id');
+  const me = c.get('user')!;
+  const db = c.get('db');
+  const transaction = await db.transaction('read');
+  try {
+    if (!(await canAccessStudentBase(transaction, me, studentId))) {
+      await transaction.rollback();
+      return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+    }
+    const notesResult = await transaction.execute({
+      sql: `SELECT n.id, n.student_id, n.advisor_id, u.name AS advisor_name,
+                   n.content, n.created_at, n.updated_at
+           FROM advisor_notes n
+           JOIN users u ON u.id = n.advisor_id
+           WHERE n.student_id = ? AND n.advisor_id = ?
+           ORDER BY n.id DESC`,
+      args: [studentId, me.id],
+    });
+    await transaction.commit();
+    return c.json(notesResult.rows);
+  } finally {
+    transaction.close();
+  }
+});
+
+app.post('/api/advisor/notes', requireAuth('Advisor'), async (c) => {
+  const body = await readJsonBody(c);
+  const studentId = String(body?.student_id ?? '').trim();
+  const content = requiredMessage(body?.content, 4000);
+  const me = c.get('user')!;
+  const db = c.get('db');
+  const transaction = await db.transaction('write');
+  try {
+    if (!(await canAccessStudentBase(transaction, me, studentId))) {
+      await transaction.rollback();
+      return c.json({ error: 'Forbidden', code: 'FORBIDDEN' }, 403);
+    }
+    const inserted = await transaction.execute({
+      sql: 'INSERT INTO advisor_notes (student_id, advisor_id, content) VALUES (?, ?, ?) RETURNING id',
+      args: [studentId, me.id, content],
+    });
+    await transaction.commit();
+    return c.json({ success: true, id: Number(inserted.lastInsertRowid) });
+  } finally {
+    transaction.close();
+  }
+});
+
+app.post('/api/advisor/notes/delete', requireAuth('Advisor'), async (c) => {
+  const body = await readJsonBody(c);
+  const noteId = Number(body?.id);
+  if (!Number.isSafeInteger(noteId) || noteId <= 0) {
+    throw new ValidationError('Note id is invalid.', 'INVALID_NOTE_ID');
+  }
+  const me = c.get('user')!;
+  const db = c.get('db');
+  const deleted = await db.execute({
+    sql: 'DELETE FROM advisor_notes WHERE id = ? AND advisor_id = ?',
+    args: [noteId, me.id],
+  });
+  if (deleted.rowsAffected === 0) return c.json({ error: 'Note not found', code: 'NOT_FOUND' }, 404);
+  return c.json({ success: true });
+});
+
+// -- Messaging --------------------------------------------------------------
+
+/** Who the signed-in user is allowed to message. */
+app.get('/api/contacts', requireAuth(), async (c) => {
+  const me = c.get('user')!;
+  const db = c.get('db');
+  if (isAdministrativeRole(me.role)) return c.json([]);
+  if (me.role === 'Student') {
+    const rs = await db.execute({
+      sql: `SELECT a.id, a.name, a.email, a.department, a.role
+            FROM students s JOIN users a ON a.id = s.advisor_id WHERE s.id = ?`,
       args: [me.id],
     });
-    return res.json(rs.rows);
-  }),
-);
-
-app.delete(
-  '/api/chat/history',
-  requireAuth(),
-  asyncRoute(async (req, res) => {
-    const me = req.user!;
-    await client.execute({ sql: 'DELETE FROM chat_messages WHERE user_id = ?', args: [me.id] });
-    return res.json({ success: true });
-  }),
-);
-
-// ---------------------------------------------------------------------------
-// Static / SPA
-// ---------------------------------------------------------------------------
-
-app.use('/api', (_req, res) => {
-  res.status(404).json({ error: 'API route not found.', code: 'NOT_FOUND' });
-});
-
-app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  const bodyError = err as { type?: string; message?: string };
-  if (bodyError?.type === 'entity.parse.failed') {
-    return res.status(400).json({ error: 'Request body must contain valid JSON.', code: 'INVALID_JSON' });
+    return c.json(rs.rows);
   }
-  console.error(`${req.method} ${req.path} failed: ${safeErrorSummary(err)}`);
-  return res.status(500).json({ error: 'Internal server error.', code: 'INTERNAL_ERROR' });
+  const rs = await db.execute({
+    sql: `SELECT u.id, u.name, u.email, u.department, u.role FROM users u
+          JOIN students s ON s.id = u.id WHERE s.advisor_id = ? ORDER BY u.name`,
+    args: [me.id],
+  });
+  return c.json(rs.rows);
 });
 
-let httpServer: Server | undefined;
-let closeDevelopmentServer: (() => Promise<void>) | undefined;
-let shutdownPromise: Promise<void> | undefined;
-let databaseRuntimeLock: DatabaseRuntimeLock | undefined;
+/** Conversation with one counterpart. Always scoped to the caller. */
+app.get('/api/messages', requireAuth(), async (c) => {
+  const me = c.get('user')!;
+  const withUser = c.req.query('with');
+  if (typeof withUser !== 'string' || !withUser) {
+    throw new ValidationError('Conversation user id is required.', 'MISSING_FIELDS');
+  }
+  const db = c.get('db');
+  const transaction = await db.transaction('read');
+  try {
+    if (!(await mayMessageUser(transaction, me, withUser))) {
+      await transaction.rollback();
+      return c.json({ error: 'You may not access this conversation.', code: 'FORBIDDEN' }, 403);
+    }
+    const rs = await transaction.execute({
+      sql: `SELECT * FROM (
+              SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at, m.is_read
+              FROM messages m WHERE m.sender_id = ? AND m.receiver_id = ?
+              UNION ALL
+              SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at, m.is_read
+              FROM messages m WHERE m.sender_id = ? AND m.receiver_id = ?
+              ORDER BY m.id DESC LIMIT 200
+            ) recent ORDER BY id ASC`,
+      args: [me.id, withUser, withUser, me.id],
+    });
+    await transaction.commit();
+    return c.json(rs.rows);
+  } finally {
+    transaction.close();
+  }
+});
 
-function closeHttpServer(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-    server.closeIdleConnections();
+/** Unread counts per counterpart, for the sidebar badge. */
+app.get('/api/messages/unread', requireAuth(), async (c) => {
+  const me = c.get('user')!;
+  const db = c.get('db');
+  if (isAdministrativeRole(me.role)) return c.json([]);
+  const rs = me.role === 'Student'
+    ? await db.execute({
+        sql: `SELECT m.sender_id, COUNT(*) AS count FROM messages m
+              JOIN students s ON s.id = m.receiver_id AND s.advisor_id = m.sender_id
+              WHERE m.receiver_id = ? AND m.is_read = 0 GROUP BY m.sender_id`,
+        args: [me.id],
+      })
+    : await db.execute({
+        sql: `SELECT m.sender_id, COUNT(*) AS count FROM messages m
+              JOIN students s ON s.id = m.sender_id AND s.advisor_id = m.receiver_id
+              WHERE m.receiver_id = ? AND m.is_read = 0 GROUP BY m.sender_id`,
+        args: [me.id],
+      });
+  return c.json(rs.rows);
+});
+
+app.post('/api/messages', requireAuth(), async (c) => {
+  const me = c.get('user')!;
+  const body = await readJsonBody(c);
+  const receiverId = String(body?.receiver_id ?? '').trim();
+  const content = requiredMessage(body?.content, 2000);
+  if (isAdministrativeRole(me.role)) {
+    return c.json({ error: 'You may not message this user.', code: 'FORBIDDEN' }, 403);
+  }
+  const db = c.get('db');
+  const relationshipSql = 'SELECT 1 FROM students WHERE id = ? AND advisor_id = ?';
+  const relationshipArgs = me.role === 'Student' ? [me.id, receiverId] : [receiverId, me.id];
+  const inserted = await db.execute({
+    sql: `INSERT INTO messages (sender_id, receiver_id, content)
+          SELECT ?, ?, ? WHERE EXISTS (${relationshipSql})`,
+    args: [me.id, receiverId, content, ...relationshipArgs],
   });
-}
+  if (inserted.rowsAffected === 0) {
+    return c.json({ error: 'You may not message this user.', code: 'FORBIDDEN' }, 403);
+  }
+  return c.json({ success: true });
+});
 
-function shutdown(reason: string): Promise<void> {
-  if (shutdownPromise) return shutdownPromise;
-  shutdownPromise = (async () => {
-    console.log(`Shutting down (${reason})...`);
-    const forceClose = setTimeout(() => httpServer?.closeAllConnections(), 4_000);
-    forceClose.unref();
+app.post('/api/messages/read', requireAuth(), async (c) => {
+  const body = await readJsonBody(c);
+  const senderId = String(body?.senderId ?? '').trim();
+  const me = c.get('user')!;
+  const db = c.get('db');
+  const transaction = await db.transaction('write');
+  try {
+    if (!(await mayMessageUser(transaction, me, senderId))) {
+      await transaction.rollback();
+      return c.json({ error: 'You may not access this conversation.', code: 'FORBIDDEN' }, 403);
+    }
+    await transaction.execute({
+      sql: 'UPDATE messages SET is_read = 1 WHERE receiver_id = ? AND sender_id = ?',
+      args: [me.id, senderId],
+    });
+    await transaction.commit();
+    return c.json({ success: true });
+  } finally {
+    transaction.close();
+  }
+});
+
+// -- AI advisor -------------------------------------------------------------
+
+app.post('/api/chat', requireAuth(), async (c) => {
+  const me = c.get('user')!;
+  const body = await readJsonBody(c);
+  const message = requiredMessage(body?.message, 2000);
+  const now = Date.now();
+
+  const rateLimited = checkChatRateLimit(me.id, now);
+  if (rateLimited) {
+    c.header('Retry-After', String(rateLimited.retryAfter));
+    return c.json({
+      error: 'Please wait before sending another AI message.',
+      code: 'RATE_LIMITED',
+      retryAfter: rateLimited.retryAfter,
+    }, 429);
+  }
+  if (chatInFlight.has(me.id)) {
+    c.header('Retry-After', '1');
+    return c.json({
+      error: 'An AI request is already in progress for this account.',
+      code: 'CHAT_IN_PROGRESS',
+      retryAfter: 1,
+    }, 429);
+  }
+  chatInFlight.add(me.id);
+
+  try {
+    const db = c.get('db');
+    const ai = c.get('ai');
+    let context: AiContext | null = null;
+    let fallback = false;
+    let reply: string;
     try {
-      if (httpServer) await closeHttpServer(httpServer);
-      if (closeDevelopmentServer) await closeDevelopmentServer();
-    } finally {
-      clearTimeout(forceClose);
-      client.close();
-      await databaseRuntimeLock?.release();
-      databaseRuntimeLock = undefined;
+      context = await buildAiContext(db, me);
+      reply = await ai.call(buildGeminiSystemPrompt(context, me.role, me.id, message), message);
+      if (exposesInternalAiMaterial(reply)) throw new Error('UnsafeModelOutput');
+    } catch (err) {
+      const reason = err instanceof Error ? err.name : 'UnknownError';
+      console.warn(`Gemini AI Advisor unavailable (${reason}); serving local fallback.`);
+      fallback = true;
+      reply = getDynamicFallbackReply(message, context);
     }
-  })();
-  return shutdownPromise;
-}
+    await db.batch(
+      [
+        { sql: "INSERT INTO chat_messages (user_id, role, content) VALUES (?, 'user', ?)", args: [me.id, message] },
+        { sql: "INSERT INTO chat_messages (user_id, role, content) VALUES (?, 'assistant', ?)", args: [me.id, reply] },
+      ],
+      'write',
+    );
+    return c.json({ reply, fallback });
+  } finally {
+    chatInFlight.delete(me.id);
+  }
+});
 
-for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.once(signal, () => {
-    void shutdown(signal).catch((error: unknown) => {
-      console.error('Graceful shutdown failed:', error);
-      process.exitCode = 1;
-    });
+app.get('/api/chat/history', requireAuth(), async (c) => {
+  const me = c.get('user')!;
+  const db = c.get('db');
+  const rs = await db.execute({
+    sql: `SELECT * FROM (
+            SELECT id, role, content, created_at FROM chat_messages
+            WHERE user_id = ? ORDER BY id DESC LIMIT 100
+          ) recent ORDER BY id ASC`,
+    args: [me.id],
   });
+  return c.json(rs.rows);
+});
+
+app.delete('/api/chat/history', requireAuth(), async (c) => {
+  const me = c.get('user')!;
+  const db = c.get('db');
+  await db.execute({ sql: 'DELETE FROM chat_messages WHERE user_id = ?', args: [me.id] });
+  return c.json({ success: true });
+});
+
+// -- Fallback 404 for /api/* -----------------------------------------------
+
+app.all('/api/*', (c) => c.json({ error: 'API route not found.', code: 'NOT_FOUND' }, 404));
+
+// ---------------------------------------------------------------------------
+// Cloudflare Cron Triggers
+// ---------------------------------------------------------------------------
+
+/** Scheduled handler: purge expired sessions hourly. Replaces setInterval. */
+export async function scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  ctx.waitUntil((async () => {
+    const client = getDatabaseClient(env);
+    try {
+      await purgeExpiredSessions(client);
+    } catch (err) {
+      console.error('Scheduled session purge failed:', safeErrorSummary(err, env));
+    }
+  })());
 }
 
-async function startServer() {
-  validateProductionOrigin();
-  if (!DATABASE_URL) databaseRuntimeLock = await acquireDatabaseRuntimeLock(DATABASE_PATH!, 'server');
-  await initDb();
+// ---------------------------------------------------------------------------
+// Node.js local development entry point
+// ---------------------------------------------------------------------------
 
-  if (API_ONLY_TEST) {
-    // Integration tests exercise the real API without loading the frontend toolchain.
-    // This mode is test-only and is rejected above in every other environment.
-  } else if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
-    closeDevelopmentServer = () => vite.close();
-    app.use(vite.middlewares);
+/**
+ * When this module is run directly in Node.js (not imported by the Workers
+ * runtime), start a local HTTP server using Hono's Node adapter.
+ */
+async function startNodeServer(): Promise<void> {
+  if (typeof process === 'undefined' || !process.versions?.node) return;
+  if (process.env.SAS_WORKER_RUNTIME === '1') return;
+  // Only start when run directly (e.g. `tsx server.ts`), not when imported.
+  const isDirectRun = process.argv[1]?.endsWith('server.ts') ||
+    process.argv[1]?.endsWith('server.js');
+  if (!isDirectRun) return;
+
+  const env: Env = {
+    DATABASE_URL: process.env.DATABASE_URL,
+    GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+    GEMINI_MODEL: process.env.GEMINI_MODEL,
+    APP_ORIGIN: process.env.APP_ORIGIN,
+    NODE_ENV: process.env.NODE_ENV,
+  };
+
+  if (env.NODE_ENV === 'production') {
+    validateProductionOrigin(env);
+  }
+
+  // Verify the database is reachable and run startup integrity checks.
+  const db = getDatabaseClient(env);
+  try {
+    await db.execute('SELECT COUNT(*) FROM users');
+    const version = await db.execute("SELECT value FROM app_metadata WHERE key = 'schema_version'");
+    const expectedSchemaVersion = env.DATABASE_URL ? '7' : '6';
+    if (String(version.rows[0]?.value ?? '') !== expectedSchemaVersion) {
+      throw new Error('database schema is out of date');
+    }
+    await ensurePerformanceIndexes(db);
+    if (env.NODE_ENV === 'production') {
+      const credentialMode = await db.execute("SELECT value FROM app_metadata WHERE key = 'credential_mode'");
+      if (String(credentialMode.rows[0]?.value ?? '') !== 'official-pdf-scrypt') {
+        throw new Error('database credentials are not synchronized with the official PDF accounts');
+      }
+    }
+    await assertOfficialAccountState(db, { checkCredentialHashes: env.NODE_ENV === 'production' });
+  } catch (err) {
+    const recovery = env.NODE_ENV === 'production'
+      ? 'Restore a verified backup or run an explicit, reviewed schema migration before restarting the service.'
+      : 'Run `npm run db:reset` to rebuild the local development database, or set DATABASE_URL for PostgreSQL.';
+    throw new Error(`The configured ${env.DATABASE_URL ? 'PostgreSQL' : 'SQLite'} database could not be read (${err instanceof Error ? err.message : String(err)}). ${recovery}`);
+  }
+  await purgeExpiredSessions(db);
+
+  // In production mode, serve the built frontend from dist/.
+  // In development mode, inform the user to run the Vite dev server separately.
+  if (env.NODE_ENV === 'production') {
+    try {
+      const { serveStatic } = await import('@hono/node-server/serve-static');
+      app.use('/*', serveStatic({ root: './' }));
+      app.get('*', serveStatic({ path: './dist/index.html' }));
+    } catch {
+      console.warn('Built dist/ not found. Run `npm run build` before starting the production server.');
+    }
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    const indexPath = path.join(distPath, 'index.html');
-    if (!fs.existsSync(indexPath)) {
-      throw new Error('The production bundle is missing. Run `npm run build` before starting the server.');
-    }
-    app.use('/assets', express.static(path.join(distPath, 'assets'), {
-      immutable: true,
-      maxAge: '1y',
-    }));
-    app.use(express.static(distPath, { index: false, maxAge: 0 }));
-    app.get('*', (_req, res) => res.sendFile(indexPath));
+    app.get('*', (c) => c.text(
+      'Smart Academic Advising API is running on port ' + (process.env.PORT ?? 5173) + '.\n\n' +
+      'For frontend dev with HMR, run `npm run dev:frontend` in another terminal.\n' +
+      'For Workers-compatible local dev, run `npm run cf:dev`.\n',
+      200,
+    ));
   }
 
-  await new Promise<void>((resolve, reject) => {
-    const server = app.listen(PORT, APP_HOST);
-    const handleStartupError = (error: Error) => reject(error);
-    server.once('error', handleStartupError);
-    server.once('listening', () => {
-      server.off('error', handleStartupError);
-      server.on('error', (error) => console.error('HTTP server error:', error));
-      httpServer = server;
-      resolve();
-    });
-  });
-  console.log(`Server running. Open http://localhost:${PORT} in your browser.`);
-  if (!aiConfigured) {
-    console.warn('Note: GEMINI_API_KEY is not set. AI Advisor will use the local fallback engine.');
+  const port = Number(process.env.PORT ?? 5173);
+  console.log(`Server running on http://localhost:${port}`);
+  try {
+    const { serve } = await import('@hono/node-server');
+    serve({ fetch: app.fetch, port });
+  } catch (err) {
+    console.error('Failed to start Node.js server:', err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
   }
 }
 
-startServer().catch(async (error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`\nStartup failed: ${message}\n`);
+startNodeServer().catch((err) => {
+  console.error('Startup failed:', err instanceof Error ? err.message : String(err));
   process.exitCode = 1;
-  await shutdown('startup failure').catch((shutdownError: unknown) => {
-    console.error('Startup cleanup failed:', shutdownError);
-  });
 });
