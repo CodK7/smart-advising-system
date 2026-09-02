@@ -1,0 +1,1 @@
+import{j as t}from"./index-BrLaBFKd.js";import{A as o}from"./AdminDashboard-DajhPcrZ.js";import"./PageInfo-Bw-oVgE2.js";import"./utils-Dv5pFye7.js";function n(r){return t.jsx(o,{...r})}export{n as default};
